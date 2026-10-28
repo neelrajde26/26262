@@ -157,13 +157,16 @@ const Store = {
         this._cache.notifications = notifRes.value.notifications.map(n => this._normalizeNotif(n));
       }
 
-      // Load admin and workflow metadata
-      try {
-        const wfRes = await API.getAdminWorkflows();
-        if (wfRes?.templates) {
-          this._cache.workflowTemplates = wfRes.templates;
-        }
-      } catch (e) {}
+      // Load admin-only metadata
+      const activeSession = Auth.getSession();
+      if (activeSession?.role === 'admin') {
+        try {
+          const wfRes = await API.getAdminWorkflows();
+          if (wfRes?.templates) {
+            this._cache.workflowTemplates = wfRes.templates;
+          }
+        } catch (e) {}
+      }
 
       // Update badge
       if (typeof Components !== 'undefined' && Components.updateNotificationBadge) {

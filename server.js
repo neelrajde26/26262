@@ -50,6 +50,64 @@ const MIME_TYPES = {
 
 const ALLOWED_UPLOAD_EXTS = ['.pdf', '.png', '.jpg', '.jpeg', '.xlsx', '.doc', '.docx'];
 const MAX_BODY_SIZE = 15 * 1024 * 1024; // 15MB limit
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_LOCK_MS = 15 * 60 * 1000;
+const MAX_LOGIN_ATTEMPTS = 5;
+const loginAttempts = new Map();
+
+function getClientIp(req) {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.trim()) {
+    return forwarded.split(',')[0].trim();
+  }
+  return req.socket.remoteAddress || '127.0.0.1';
+}
+
+function getLoginAttemptKey(req, username) {
+  const ip = getClientIp(req);
+  const normalizedUser = (username || '').trim().toLowerCase();
+  return `${ip}::${normalizedUser}`;
+}
+
+function getLoginRateLimitState(key) {
+  const now = Date.now();
+  const entry = loginAttempts.get(key);
+  if (!entry) {
+    return { limited: false, retryAfterMs: 0 };
+  }
+  if (entry.lockUntil && entry.lockUntil > now) {
+    return { limited: true, retryAfterMs: entry.lockUntil - now };
+  }
+  if (entry.windowStart + LOGIN_WINDOW_MS <= now) {
+    loginAttempts.delete(key);
+    return { limited: false, retryAfterMs: 0 };
+  }
+  return { limited: false, retryAfterMs: 0 };
+}
+
+function registerFailedLoginAttempt(key) {
+  const now = Date.now();
+  const entry = loginAttempts.get(key);
+
+  if (!entry || entry.windowStart + LOGIN_WINDOW_MS <= now) {
+    loginAttempts.set(key, {
+      count: 1,
+      windowStart: now,
+      lockUntil: 0
+    });
+    return;
+  }
+
+  entry.count += 1;
+  if (entry.count >= MAX_LOGIN_ATTEMPTS) {
+    entry.lockUntil = now + LOGIN_LOCK_MS;
+  }
+  loginAttempts.set(key, entry);
+}
+
+function clearFailedLoginAttempts(key) {
+  loginAttempts.delete(key);
+}
 
 // JSON response helper
 function sendJSON(res, statusCode, data, headers = {}) {
@@ -309,10 +367,25 @@ const server = http.createServer(async (req, res) => {
         if (!body.username || !body.password) {
           return sendProblem(res, 400, 'Bad Request', 'Username and password are required', pathname);
         }
+
+        const loginKey = getLoginAttemptKey(req, body.username);
+        const limitState = getLoginRateLimitState(loginKey);
+        if (limitState.limited) {
+          return sendProblem(
+            res,
+            429,
+            'Too Many Requests',
+            `Too many failed login attempts. Retry after ${Math.ceil(limitState.retryAfterMs / 1000)} seconds.`,
+            pathname
+          );
+        }
+
         const result = authenticateUser(body.username.trim(), body.password);
         if (!result.success) {
+          registerFailedLoginAttempt(loginKey);
           return sendProblem(res, 401, 'Unauthorized', result.error, pathname);
         }
+        clearFailedLoginAttempts(loginKey);
 
         const isHttps = req.headers['x-forwarded-proto'] === 'https';
         const secureFlag = isHttps ? '; Secure' : '';
@@ -1143,6 +1216,13 @@ const server = http.createServer(async (req, res) => {
 
       // 29. Reports & Analytics (Properly Scoped)
       if (pathname === '/api/reports/stats' && method === 'GET') {
+        if (
+          !hasPermission(session.role, 'view_region_reports') &&
+          !hasPermission(session.role, 'view_all_reports')
+        ) {
+          return sendProblem(res, 403, 'Forbidden', 'Unauthorized: Your role does not have permission to view reports', pathname);
+        }
+
         let appFilter = '1=1';
         let undFilter = '1=1';
         const params = [];
@@ -1223,6 +1303,9 @@ const server = http.createServer(async (req, res) => {
 
       // 31. Admin: Workflows
       if (pathname === '/api/admin/workflows' && method === 'GET') {
+        if (session.role !== 'admin') {
+          return sendProblem(res, 403, 'Forbidden', 'Admin role required to view workflow templates', pathname);
+        }
         const tmpls = db.prepare('SELECT * FROM workflow_templates').all();
         tmpls.forEach(t => {
           try { t.stages = JSON.parse(t.stages); } catch(e) {}
@@ -1233,12 +1316,18 @@ const server = http.createServer(async (req, res) => {
 
       // 32. Admin: Escalation Rules
       if (pathname === '/api/admin/escalation-rules' && method === 'GET') {
+        if (session.role !== 'admin') {
+          return sendProblem(res, 403, 'Forbidden', 'Admin role required to view escalation rules', pathname);
+        }
         const rules = db.prepare('SELECT * FROM escalation_rules').all();
         return sendJSON(res, 200, { escalationRules: rules });
       }
 
       // 33. Admin: Users
       if (pathname === '/api/admin/users' && method === 'GET') {
+        if (session.role !== 'admin') {
+          return sendProblem(res, 403, 'Forbidden', 'Admin role required to view users', pathname);
+        }
         const users = db.prepare('SELECT id, username, full_name, role, region, institution_id, email, active, created_at FROM users').all();
         return sendJSON(res, 200, { users });
       }

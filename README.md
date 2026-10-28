@@ -147,7 +147,7 @@ npm test
 node tests/run-tests.js
 ```
 
-### Verified Test Battery (22 Passed, 0 Failed):
+### Verified Test Battery (24 Passed, 0 Failed):
 - `✓ All core tables and indexes are created in SQLite`
 - `✓ Database seeded with realistic demo fixtures`
 - `✓ Password hashing generates valid salt and PBKDF2 hash`
@@ -170,7 +170,9 @@ node tests/run-tests.js
 - `✓ AI Regulatory query helper resolves workflow terminology`
 - `✓ Upload extension validation accepts valid formats and blocks dangerous formats`
 - `✓ Path traversal attempts are detected and prevented`
-- **Result: 22 Passed, 0 Failed**
+- `✓ Admin endpoints are restricted to admin role only`
+- `✓ Repeated failed logins are rate-limited`
+- **Result: 24 Passed, 0 Failed**
 
 ---
 
@@ -186,7 +188,7 @@ node tests/run-tests.js
 │   ├── scheduler.js             # Automated SLA due-date scanner & escalation engine
 │   └── ai-service.js            # AI Case Briefs, checklists & regulatory search
 ├── tests/
-│   └── run-tests.js             # Automated regression test suite (22 tests)
+│   └── run-tests.js             # Automated regression test suite (24 tests)
 ├── data/
 │   └── flowguard.db             # Persistent SQLite database file
 ├── uploads/                     # Document storage repository (protected by router)
@@ -227,4 +229,3 @@ node tests/run-tests.js
 ---
 
 *AICTE FlowGuard — Empowering Institutional Excellence through Transparent, Automated Governance.*
-

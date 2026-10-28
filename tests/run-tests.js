@@ -3,6 +3,7 @@
    ============================================ */
 
 const assert = require('node:assert');
+const { spawn } = require('node:child_process');
 const { db, seedDatabase, hashPassword, verifyPassword } = require('../server/db.js');
 const {
   ROLES,
@@ -334,6 +335,88 @@ async function runAllTests() {
     }
   });
 
+  console.log('\n--- 8. API Authorization & Login Protection ---');
+  await asyncTest('Admin endpoints are restricted to admin role only', async () => {
+    const port = 5601;
+    const serverProc = spawn(process.execPath, ['server.js'], {
+      cwd: process.cwd(),
+      env: { ...process.env, PORT: String(port), NODE_ENV: 'test' },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    try {
+      await waitForServer(port);
+      const institutionLogin = await fetchJson(`http://127.0.0.1:${port}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'inst_demotech', password: 'demo123' })
+      });
+      assert.strictEqual(institutionLogin.status, 200, 'Institution login should succeed');
+      assert.ok(institutionLogin.json.token, 'Institution login returns token');
+
+      const deniedUsers = await fetchJson(`http://127.0.0.1:${port}/api/admin/users`, {
+        headers: { Authorization: 'Bearer ' + institutionLogin.json.token }
+      });
+      assert.strictEqual(deniedUsers.status, 403, 'Institution user must not access admin users endpoint');
+
+      const deniedRules = await fetchJson(`http://127.0.0.1:${port}/api/admin/escalation-rules`, {
+        headers: { Authorization: 'Bearer ' + institutionLogin.json.token }
+      });
+      assert.strictEqual(deniedRules.status, 403, 'Institution user must not access escalation rules endpoint');
+
+      const adminLogin = await fetchJson(`http://127.0.0.1:${port}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'admin', password: 'demo123' })
+      });
+      assert.strictEqual(adminLogin.status, 200, 'Admin login should succeed');
+      assert.ok(adminLogin.json.token, 'Admin login returns token');
+
+      const adminUsers = await fetchJson(`http://127.0.0.1:${port}/api/admin/users`, {
+        headers: { Authorization: 'Bearer ' + adminLogin.json.token }
+      });
+      assert.strictEqual(adminUsers.status, 200, 'Admin can access users endpoint');
+      assert.ok(Array.isArray(adminUsers.json.users), 'Users response is an array');
+    } finally {
+      serverProc.kill('SIGTERM');
+      await waitForExit(serverProc);
+    }
+  });
+
+  await asyncTest('Repeated failed logins are rate-limited', async () => {
+    const port = 5602;
+    const serverProc = spawn(process.execPath, ['server.js'], {
+      cwd: process.cwd(),
+      env: { ...process.env, PORT: String(port), NODE_ENV: 'test' },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    try {
+      await waitForServer(port);
+
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        const invalid = await fetchJson(`http://127.0.0.1:${port}/api/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: 'ro_north', password: `wrong-${attempt}` })
+        });
+        assert.strictEqual(invalid.status, 401, `Attempt ${attempt} should still be unauthorized`);
+      }
+
+      const throttled = await fetchJson(`http://127.0.0.1:${port}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: 'ro_north', password: 'still-wrong' })
+      });
+
+      assert.strictEqual(throttled.status, 429, '6th failed login should be rate-limited');
+      assert.strictEqual(throttled.json.status, 429, 'Problem response includes 429 status');
+    } finally {
+      serverProc.kill('SIGTERM');
+      await waitForExit(serverProc);
+    }
+  });
+
   console.log('\n================================================');
   console.log(` Test Results: ${passedTests} Passed, ${failedTests} Failed`);
   console.log('================================================\n');
@@ -344,3 +427,43 @@ async function runAllTests() {
 }
 
 runAllTests();
+
+async function waitForServer(port, timeoutMs = 10000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/health`);
+      if (res.ok) return;
+    } catch (err) {}
+    await new Promise(r => setTimeout(r, 150));
+  }
+  throw new Error(`Server did not become healthy on port ${port} within ${timeoutMs}ms`);
+}
+
+async function fetchJson(targetUrl, options = {}) {
+  const res = await fetch(targetUrl, options);
+  let json = {};
+  try {
+    json = await res.json();
+  } catch (err) {}
+  return { status: res.status, json };
+}
+
+async function waitForExit(proc, timeoutMs = 5000) {
+  return new Promise(resolve => {
+    let settled = false;
+    const done = () => {
+      if (!settled) {
+        settled = true;
+        resolve();
+      }
+    };
+    proc.once('exit', done);
+    setTimeout(() => {
+      if (!settled) {
+        proc.kill('SIGKILL');
+      }
+      done();
+    }, timeoutMs);
+  });
+}
