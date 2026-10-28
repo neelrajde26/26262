@@ -139,13 +139,15 @@ curl http://localhost:5500/api/health
 
 ## 🧪 Automated Testing & Verification
 
-A comprehensive automated test suite verifies database schema, password hashing, JWT signatures, RBAC permissions, state machine transitions, deduplication, and AI services:
+A comprehensive automated test suite verifies database schema, password hashing, JWT signatures, table-aware RBAC data scoping, cross-institution isolation, regional jurisdiction boundaries, workflow transitions, scheduler deduplication, AI services, file upload extension allowlists, and path traversal guards:
 
 ```bash
+npm test
+# or
 node tests/run-tests.js
 ```
 
-### Verified Test Battery:
+### Verified Test Battery (22 Passed, 0 Failed):
 - `✓ All core tables and indexes are created in SQLite`
 - `✓ Database seeded with realistic demo fixtures`
 - `✓ Password hashing generates valid salt and PBKDF2 hash`
@@ -153,7 +155,11 @@ node tests/run-tests.js
 - `✓ Tampered token is rejected`
 - `✓ Role permissions enforced correctly`
 - `✓ SQL data scoping filters records by institution and region`
+- `✓ Table-aware SQL scoping prevents non-existent column errors across all entities`
+- `✓ Cross-institution isolation is strictly enforced`
+- `✓ All 8 demo accounts authenticate successfully and have assigned roles`
 - `✓ Authorized officer can advance application stage`
+- `✓ Regional officer cannot advance application outside their jurisdiction`
 - `✓ Unauthorized user is blocked from advancing workflow`
 - `✓ Returning application records mandatory reason and changes status`
 - `✓ Competent Authority can approve application`
@@ -162,7 +168,9 @@ node tests/run-tests.js
 - `✓ AI Service generates application summary with human-in-the-loop disclaimers`
 - `✓ AI Service generates APH compliance checklist for program types`
 - `✓ AI Regulatory query helper resolves workflow terminology`
-- **Result: 16 Passed, 0 Failed**
+- `✓ Upload extension validation accepts valid formats and blocks dangerous formats`
+- `✓ Path traversal attempts are detected and prevented`
+- **Result: 22 Passed, 0 Failed**
 
 ---
 
@@ -170,20 +178,21 @@ node tests/run-tests.js
 
 ```
 26262/
-├── server.js                    # Full-stack HTTP server & REST API
+├── server.js                    # Full-stack HTTP server, REST API & file handlers
 ├── server/
 │   ├── db.js                    # Native SQLite database, schema, migrations & seed
-│   ├── auth.js                  # Authentication, RBAC permissions, JWT tokens & scoping
-│   ├── workflow-engine.js       # Workflow state machine & stage transition logic
+│   ├── auth.js                  # Authentication, RBAC, constant-time crypto & table-aware scoping
+│   ├── workflow-engine.js       # Workflow state machine & regional jurisdiction checks
 │   ├── scheduler.js             # Automated SLA due-date scanner & escalation engine
 │   └── ai-service.js            # AI Case Briefs, checklists & regulatory search
 ├── tests/
-│   └── run-tests.js             # Automated test suite (16 tests)
+│   └── run-tests.js             # Automated regression test suite (22 tests)
 ├── data/
 │   └── flowguard.db             # Persistent SQLite database file
-├── uploads/                     # Document storage repository
+├── uploads/                     # Document storage repository (protected by router)
 ├── Dockerfile                   # Production container definition
 ├── docker-compose.yml           # Container orchestration with volume mounts
+├── .env.example                 # Environment configuration template
 ├── package.json                 # Project configuration & npm scripts
 ├── index.html                   # Single-Page Application interface
 ├── css/
@@ -194,13 +203,13 @@ node tests/run-tests.js
 │   ├── pages.css                # Page-specific views and stage timelines
 │   └── responsive.css           # Breakpoints for mobile, tablet, and desktop
 └── js/
-    ├── api.js                   # REST API client bridge
+    ├── api.js                   # REST API client bridge with RFC 7807 problem details
     ├── utils.js                 # Formatting, XSS prevention, pagination
-    ├── store.js                 # Local store & offline cache
-    ├── seed.js                  # Client fixture data
-    ├── auth.js                  # Client authentication helpers
-    ├── router.js                # Protected SPA routing
-    ├── components.js            # Shared UI components & SVG charts
+    ├── store.js                 # Synchronized SQLite bridge & repository cache
+    ├── seed.js                  # Client fixture normalizers & fallback seeds
+    ├── auth.js                  # Client session & server authentication
+    ├── router.js                # Protected async SPA routing & error boundary
+    ├── components.js            # Shared UI components, charts & loading feedback
     ├── app.js                   # Client lifecycle bootstrap
     └── pages/
         ├── dashboard.js         # Real-time metrics & pendency overview
@@ -218,3 +227,4 @@ node tests/run-tests.js
 ---
 
 *AICTE FlowGuard — Empowering Institutional Excellence through Transparent, Automated Governance.*
+
