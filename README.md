@@ -147,7 +147,7 @@ npm test
 node tests/run-tests.js
 ```
 
-### Verified Test Battery (24 Passed, 0 Failed):
+### Verified Test Battery (34 Passed, 0 Failed):
 - `✓ All core tables and indexes are created in SQLite`
 - `✓ Database seeded with realistic demo fixtures`
 - `✓ Password hashing generates valid salt and PBKDF2 hash`
@@ -172,7 +172,17 @@ node tests/run-tests.js
 - `✓ Path traversal attempts are detected and prevented`
 - `✓ Admin endpoints are restricted to admin role only`
 - `✓ Repeated failed logins are rate-limited`
-- **Result: 24 Passed, 0 Failed**
+- `✓ Valid HTTP login returns signed JWT, user payload, and HttpOnly cookie`
+- `✓ Missing or invalid credentials return 400 Bad Request or 401 Unauthorized`
+- `✓ JWT algorithm verification, expiration, and tampering guards`
+- `✓ Session restoration via /api/auth/me with Bearer token and Cookie`
+- `✓ Logout clears session cookie and records audit trail`
+- `✓ All eight seeded demo accounts authenticate and return correct roles and scopes`
+- `✓ Disabled accounts cannot authenticate or access protected endpoints`
+- `✓ Institutional registration assigns least privilege role and rejects role escalation`
+- `✓ Registration validates inputs and prevents duplicate username or email`
+- `✓ Administrator user provisioning, role validation, and disable toggle`
+- **Result: 34 Passed, 0 Failed**
 
 ---
 
@@ -188,7 +198,8 @@ node tests/run-tests.js
 │   ├── scheduler.js             # Automated SLA due-date scanner & escalation engine
 │   └── ai-service.js            # AI Case Briefs, checklists & regulatory search
 ├── tests/
-│   └── run-tests.js             # Automated regression test suite (24 tests)
+│   ├── run-tests.js             # Automated regression test suite (34 tests)
+│   └── auth-lifecycle.test.js   # Full-stack authentication lifecycle integration tests
 ├── data/
 │   └── flowguard.db             # Persistent SQLite database file
 ├── uploads/                     # Document storage repository (protected by router)

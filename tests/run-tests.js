@@ -417,6 +417,9 @@ async function runAllTests() {
     }
   });
 
+  const { runAuthIntegrationTests } = require('./auth-lifecycle.test.js');
+  await runAuthIntegrationTests({ test, asyncTest });
+
   console.log('\n================================================');
   console.log(` Test Results: ${passedTests} Passed, ${failedTests} Failed`);
   console.log('================================================\n');
