@@ -7,10 +7,18 @@ const EVCPage = {
   currentRegion: '',
   searchQuery: '',
 
-  render() {
+  async render() {
     const container = document.getElementById('page-container');
     const session = Auth.getSession();
     const canManage = Auth.hasPermission('manage_evc');
+
+    container.innerHTML = Components.renderLoadingState('Loading EVC inspection visits...');
+
+    try {
+      await Store.fetchEvc();
+    } catch (err) {
+      console.error('Failed to load EVC visits:', err);
+    }
 
     let events = Store.getAll('evcEvents');
     events = Auth.filterByScope(events, 'evc');
@@ -238,7 +246,7 @@ const EVCPage = {
     const committeeUsers = Store.getAll('users').filter(u => u.role === 'committee' || u.role === 'regional_officer');
 
     const bodyHtml = `
-      <form id="schedule-evc-form">
+      <form id="schedule-evc-form" onsubmit="event.preventDefault(); EVCPage.handleScheduleSubmit('${eventId}');">
         <div class="form-group">
           <label class="form-label">Application</label>
           <input type="text" class="form-input" value="${Utils.escapeHtml(event.applicationNumber)} — ${Utils.escapeHtml(event.institutionName)}" disabled>
@@ -267,7 +275,7 @@ const EVCPage = {
 
     const footerHtml = `
       <button class="btn btn-ghost" onclick="Components.closeModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="EVCPage.handleScheduleSubmit('${eventId}')">
+      <button class="btn btn-primary" id="btn-confirm-schedule" onclick="EVCPage.handleScheduleSubmit('${eventId}')">
         <span class="material-icons-round">event_available</span> Confirm Schedule
       </button>
     `;
@@ -275,65 +283,34 @@ const EVCPage = {
     Components.showModal('Schedule EVC Visit', bodyHtml, footerHtml);
   },
 
-  handleScheduleSubmit(eventId) {
+  async handleScheduleSubmit(eventId) {
     const expertSelect = document.getElementById('modal-evc-expert');
     const dateInput = document.getElementById('modal-evc-date');
     const notesInput = document.getElementById('modal-evc-notes');
+    const btn = document.getElementById('btn-confirm-schedule');
 
-    if (!expertSelect.value || !dateInput.value) {
+    if (!expertSelect || !expertSelect.value || !dateInput || !dateInput.value) {
       Components.showToast('Please select an expert and a visit date.', 'warning');
       return;
     }
 
-    const expert = Store.getById('users', expertSelect.value);
-    const session = Auth.getSession();
-
-    Store.update('evcEvents', eventId, {
-      status: 'scheduled',
-      committeeId: expert.id,
-      committeeName: expert.fullName,
-      plannedDate: dateInput.value,
-      notes: notesInput.value.trim()
-    });
-
-    const evt = Store.getById('evcEvents', eventId);
-
-    // Update application stage if needed
-    if (evt && evt.applicationId) {
-      const app = Store.getById('applications', evt.applicationId);
-      if (app && app.status === 'evc-pending') {
-        Store.update('applications', app.id, {
-          status: 'evc-scheduled',
-          currentStage: 'evc-scheduled',
-          currentStageDueDate: Utils.dateOffset(15)
-        });
-      }
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = `<span class="spinner" style="width:16px;height:16px;border-width:2px;display:inline-block;vertical-align:middle;margin-right:6px;"></span> Scheduling...`;
     }
 
-    // Add Audit log
-    Store.addAudit({
-      actor: session.userId,
-      actorName: session.fullName,
-      action: 'evc_scheduled',
-      entityType: 'evc',
-      entityId: eventId,
-      details: `Scheduled visit for ${evt.institutionName} on ${Utils.formatDate(dateInput.value)} lead by ${expert.fullName}`
-    });
-
-    // Notify committee expert
-    Store.addNotification({
-      type: 'evc_scheduled',
-      title: 'EVC Visit Assigned',
-      message: `You have been assigned to conduct an EVC visit for ${evt.institutionName} on ${Utils.formatDate(dateInput.value)}.`,
-      recipientId: expert.id,
-      recipientRole: 'committee',
-      entityType: 'evc',
-      entityId: eventId,
-    });
-
-    Components.closeModal();
-    Components.showToast('EVC Visit successfully scheduled!', 'success');
-    this.render();
+    try {
+      await Store.scheduleEvc(eventId, expertSelect.value, dateInput.value, notesInput ? notesInput.value.trim() : '');
+      Components.closeModal();
+      Components.showToast('EVC Visit successfully scheduled!', 'success');
+      await this.render();
+    } catch (err) {
+      Components.showToast(err.message || 'Failed to schedule EVC visit', 'error');
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = `<span class="material-icons-round">event_available</span> Confirm Schedule`;
+      }
+    }
   },
 
   showReportModal(eventId) {
@@ -341,7 +318,7 @@ const EVCPage = {
     if (!event) return;
 
     const bodyHtml = `
-      <form id="report-evc-form">
+      <form id="report-evc-form" onsubmit="event.preventDefault(); EVCPage.handleReportSubmit('${eventId}');">
         <div class="form-group">
           <label class="form-label">Application</label>
           <input type="text" class="form-input" value="${Utils.escapeHtml(event.applicationNumber)} — ${Utils.escapeHtml(event.institutionName)}" disabled>
@@ -367,7 +344,7 @@ const EVCPage = {
 
     const footerHtml = `
       <button class="btn btn-ghost" onclick="Components.closeModal()">Cancel</button>
-      <button class="btn btn-success" onclick="EVCPage.handleReportSubmit('${eventId}')">
+      <button class="btn btn-success" id="btn-submit-report" onclick="EVCPage.handleReportSubmit('${eventId}')">
         <span class="material-icons-round">task_alt</span> Submit Inspection Report
       </button>
     `;
@@ -375,75 +352,34 @@ const EVCPage = {
     Components.showModal('Submit EVC Inspection Report', bodyHtml, footerHtml);
   },
 
-  handleReportSubmit(eventId) {
+  async handleReportSubmit(eventId) {
     const completedDate = document.getElementById('modal-evc-completed-date');
     const recSelect = document.getElementById('modal-evc-recommendation');
     const reportText = document.getElementById('modal-evc-report');
+    const btn = document.getElementById('btn-submit-report');
 
-    if (!reportText.value.trim() || !completedDate.value) {
+    if (!reportText || !reportText.value.trim() || !completedDate || !completedDate.value) {
       Components.showToast('Please fill in the completed date and inspection report.', 'warning');
       return;
     }
 
-    const session = Auth.getSession();
-    const event = Store.getById('evcEvents', eventId);
-
-    const fullReport = `[Recommendation: ${recSelect.value.toUpperCase()}]\n${reportText.value.trim()}`;
-
-    Store.update('evcEvents', eventId, {
-      status: 'completed',
-      completedDate: completedDate.value,
-      report: fullReport
-    });
-
-    // Update Application stage to evc-completed
-    if (event && event.applicationId) {
-      const app = Store.getById('applications', event.applicationId);
-      if (app) {
-        const nextDueDate = Utils.dateOffset(7);
-        const stageHistory = app.stageHistory || [];
-        stageHistory.push({
-          stage: 'evc-completed',
-          date: completedDate.value,
-          actor: session.userId,
-          actorName: session.fullName,
-          action: 'EVC report submitted',
-          notes: fullReport
-        });
-
-        Store.update('applications', app.id, {
-          status: 'evc-completed',
-          currentStage: 'evc-completed',
-          currentStageDueDate: nextDueDate,
-          stageHistory
-        });
-      }
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = `<span class="spinner" style="width:16px;height:16px;border-width:2px;display:inline-block;vertical-align:middle;margin-right:6px;"></span> Submitting...`;
     }
 
-    // Add Audit
-    Store.addAudit({
-      actor: session.userId,
-      actorName: session.fullName,
-      action: 'evc_completed',
-      entityType: 'evc',
-      entityId: eventId,
-      details: `Submitted EVC inspection report for ${event.institutionName}. Recommendation: ${recSelect.value}`
-    });
-
-    // Notify regional officer
-    Store.addNotification({
-      type: 'evc_scheduled',
-      title: 'EVC Report Submitted',
-      message: `Inspection report submitted for ${event.institutionName} (${event.applicationNumber}). Ready for SAC/SHC review.`,
-      recipientRole: 'regional_officer',
-      recipientRegion: event.region,
-      entityType: 'application',
-      entityId: event.applicationId,
-    });
-
-    Components.closeModal();
-    Components.showToast('EVC Inspection Report submitted successfully!', 'success');
-    this.render();
+    try {
+      await Store.submitEvcReport(eventId, recSelect.value, reportText.value.trim(), completedDate.value);
+      Components.closeModal();
+      Components.showToast('EVC Inspection Report submitted successfully!', 'success');
+      await this.render();
+    } catch (err) {
+      Components.showToast(err.message || 'Failed to submit inspection report', 'error');
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = `<span class="material-icons-round">task_alt</span> Submit Inspection Report`;
+      }
+    }
   },
 
   viewFullReport(eventId) {

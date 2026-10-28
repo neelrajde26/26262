@@ -5,9 +5,17 @@
 const ReportsPage = {
   selectedRegion: 'all',
 
-  render() {
+  async render() {
     const container = document.getElementById('page-container');
     const session = Auth.getSession();
+
+    container.innerHTML = Components.renderLoadingState('Compiling compliance analytics and metrics...');
+
+    try {
+      await Store.loadAll();
+    } catch (err) {
+      console.error('Failed to load reports data:', err);
+    }
 
     let apps = Store.getAll('applications');
     apps = Auth.filterByScope(apps, 'application');

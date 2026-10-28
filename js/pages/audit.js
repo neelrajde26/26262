@@ -9,8 +9,16 @@ const AuditPage = {
   entityFilter: '',
   searchQuery: '',
 
-  render() {
+  async render() {
     const container = document.getElementById('page-container');
+    container.innerHTML = Components.renderLoadingState('Loading audit trail records...');
+
+    try {
+      await Store.fetchAudits();
+    } catch (err) {
+      console.error('Failed to load audits:', err);
+    }
+
     const audits = Store.getAll('audit').sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
     const totalAudits = audits.length;

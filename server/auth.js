@@ -5,7 +5,15 @@
 const crypto = require('node:crypto');
 const { db, verifyPassword } = require('./db.js');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'flowguard-sih2026-super-secure-hmac-secret-key-32bytes';
+// Enforce strong secret in production; use dev-only fallback with warning in non-production
+let JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('FATAL SECURITY CONFIGURATION: JWT_SECRET environment variable must be set in production mode!');
+  } else {
+    JWT_SECRET = 'flowguard-dev-only-hmac-secret-key-minimum-32-chars-long';
+  }
+}
 
 // Role definitions with fine-grained permissions and organizational scopes
 const ROLES = {
@@ -31,6 +39,7 @@ const ROLES = {
       'advance_stage',
       'return_application',
       'view_evc',
+      'manage_evc',
       'review_undertaking',
       'assign_undertaking',
       'review_document',
@@ -113,15 +122,21 @@ function createToken(payload) {
   return `${header}.${body}.${signature}`;
 }
 
-// Verify a session token
+// Verify a session token with timing-safe comparison
 function verifyToken(token) {
-  if (!token) return null;
+  if (!token || typeof token !== 'string') return null;
   const parts = token.split('.');
   if (parts.length !== 3) return null;
   const [header, body, signature] = parts;
-  const expectedSig = crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${body}`).digest('base64url');
-  if (expectedSig !== signature) return null;
+
   try {
+    const expectedSig = crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${body}`).digest('base64url');
+    const sigBuf = Buffer.from(signature);
+    const expBuf = Buffer.from(expectedSig);
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+      return null;
+    }
+
     const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
     if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) return null;
     return payload;
@@ -132,6 +147,10 @@ function verifyToken(token) {
 
 // Authenticate user via username and password
 function authenticateUser(username, password) {
+  if (!username || !password) {
+    return { success: false, error: 'Username and password are required' };
+  }
+
   const user = db.prepare('SELECT * FROM users WHERE username = ? AND active = 1').get(username);
   if (!user) return { success: false, error: 'Invalid credentials or account disabled' };
 
@@ -152,7 +171,7 @@ function authenticateUser(username, password) {
 
   const token = createToken(sessionUser);
 
-  // Log audit
+  // Log audit entry
   db.prepare(`
     INSERT INTO audit_trail VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
@@ -192,26 +211,153 @@ function hasPermission(role, permission) {
   return def.permissions.includes(permission);
 }
 
-// Check scope filter for SQL queries
-function getScopeClause(user, tableAlias = '') {
-  const prefix = tableAlias ? `${tableAlias}.` : '';
-  const roleDef = ROLES[user.role];
+// Table-aware SQL scope clause builder
+function getScopeClause(user, tableName = 'applications', tableAlias = '') {
+  // Support calling signature getScopeClause(user, tableAlias) if tableName is not a recognized table
+  let targetTable = 'applications';
+  let alias = '';
+  const recognizedTables = ['applications', 'evc_events', 'undertakings', 'documents', 'notifications', 'audit_trail', 'institutions'];
+
+  if (recognizedTables.includes(tableName)) {
+    targetTable = tableName;
+    alias = tableAlias;
+  } else if (typeof tableName === 'string' && tableName.length > 0) {
+    alias = tableName;
+  }
+
+  const prefix = alias ? `${alias}.` : '';
+  const roleDef = ROLES[user?.role];
   if (!roleDef) return { sql: '0 = 1', params: [] };
 
-  switch (roleDef.scope) {
-    case 'all':
-      return { sql: '1 = 1', params: [] };
-    case 'institution':
-      return { sql: `${prefix}institution_id = ?`, params: [user.institutionId] };
-    case 'region':
-      return { sql: `${prefix}region = ?`, params: [user.region] };
-    case 'bureau':
-      return { sql: `(${prefix}region = ? OR ${prefix}assigned_officer = ?)`, params: [user.region, user.userId] };
-    case 'assigned':
-      return { sql: `(${prefix}assigned_officer = ? OR ${prefix}id IN (SELECT application_id FROM evc_events WHERE committee_id = ?))`, params: [user.userId, user.userId] };
-    default:
-      return { sql: '0 = 1', params: [] };
+  if (roleDef.scope === 'all') {
+    return { sql: '1 = 1', params: [] };
   }
+
+  if (targetTable === 'applications') {
+    switch (roleDef.scope) {
+      case 'institution':
+        return { sql: `${prefix}institution_id = ?`, params: [user.institutionId || ''] };
+      case 'region':
+        return { sql: `${prefix}region = ?`, params: [user.region || ''] };
+      case 'bureau':
+        return { sql: `(${prefix}region = ? OR ${prefix}assigned_officer = ?)`, params: [user.region || '', user.userId || ''] };
+      case 'assigned':
+        return { sql: `(${prefix}assigned_officer = ? OR ${prefix}id IN (SELECT application_id FROM evc_events WHERE committee_id = ?))`, params: [user.userId || '', user.userId || ''] };
+      default:
+        return { sql: '0 = 1', params: [] };
+    }
+  }
+
+  if (targetTable === 'evc_events') {
+    switch (roleDef.scope) {
+      case 'institution':
+        return { sql: `${prefix}institution_id = ?`, params: [user.institutionId || ''] };
+      case 'region':
+        return { sql: `${prefix}region = ?`, params: [user.region || ''] };
+      case 'bureau':
+        return { sql: `(${prefix}region = ? OR ${prefix}committee_id = ?)`, params: [user.region || '', user.userId || ''] };
+      case 'assigned':
+        return { sql: `${prefix}committee_id = ?`, params: [user.userId || ''] };
+      default:
+        return { sql: '0 = 1', params: [] };
+    }
+  }
+
+  if (targetTable === 'undertakings') {
+    switch (roleDef.scope) {
+      case 'institution':
+        return { sql: `${prefix}institution_id = ?`, params: [user.institutionId || ''] };
+      case 'region':
+        return { sql: `${prefix}region = ?`, params: [user.region || ''] };
+      case 'bureau':
+        return { sql: `(${prefix}region = ? OR ${prefix}verification_owner = ?)`, params: [user.region || '', user.userId || ''] };
+      case 'assigned':
+        return { sql: `${prefix}institution_id IN (SELECT institution_id FROM evc_events WHERE committee_id = ?)`, params: [user.userId || ''] };
+      default:
+        return { sql: '0 = 1', params: [] };
+    }
+  }
+
+  if (targetTable === 'documents') {
+    switch (roleDef.scope) {
+      case 'institution':
+        return { sql: `${prefix}institution_id = ?`, params: [user.institutionId || ''] };
+      case 'region':
+        return { sql: `${prefix}region = ?`, params: [user.region || ''] };
+      case 'bureau':
+        return { sql: `${prefix}region = ?`, params: [user.region || ''] };
+      case 'assigned':
+        return { sql: `${prefix}institution_id IN (SELECT institution_id FROM evc_events WHERE committee_id = ?)`, params: [user.userId || ''] };
+      default:
+        return { sql: '0 = 1', params: [] };
+    }
+  }
+
+  if (targetTable === 'notifications') {
+    switch (roleDef.scope) {
+      case 'institution':
+        return { sql: `(${prefix}recipient_id = ? OR (${prefix}recipient_institution = ? AND ${prefix}recipient_role = 'institution'))`, params: [user.userId || '', user.institutionId || ''] };
+      case 'region':
+        return { sql: `(${prefix}recipient_id = ? OR ${prefix}recipient_role = ? OR (${prefix}recipient_region = ? AND ? IN ('regional_officer', 'bureau_officer')))`, params: [user.userId || '', user.role, user.region || '', user.role] };
+      case 'bureau':
+        return { sql: `(${prefix}recipient_id = ? OR ${prefix}recipient_role = ? OR ${prefix}recipient_region = ?)`, params: [user.userId || '', user.role, user.region || ''] };
+      case 'assigned':
+        return { sql: `(${prefix}recipient_id = ? OR ${prefix}recipient_role = ?)`, params: [user.userId || '', user.role] };
+      default:
+        return { sql: '0 = 1', params: [] };
+    }
+  }
+
+  if (targetTable === 'audit_trail') {
+    switch (roleDef.scope) {
+      case 'institution':
+        return {
+          sql: `(${prefix}actor_id = ? OR ${prefix}entity_id IN (SELECT id FROM applications WHERE institution_id = ?) OR ${prefix}entity_id = ?)`,
+          params: [user.userId || '', user.institutionId || '', user.institutionId || '']
+        };
+      case 'region':
+        return {
+          sql: `(${prefix}actor_id = ? OR ${prefix}entity_id IN (SELECT id FROM applications WHERE region = ?) OR ${prefix}entity_id IN (SELECT id FROM institutions WHERE region = ?))`,
+          params: [user.userId || '', user.region || '', user.region || '']
+        };
+      case 'bureau':
+        return { sql: '1 = 1', params: [] };
+      default:
+        return { sql: '0 = 1', params: [] };
+    }
+  }
+
+  return { sql: '1 = 1', params: [] };
+}
+
+// Verify if a user is authorized to access a given record
+function canAccessRecord(user, tableName, record) {
+  if (!user || !record) return false;
+  const roleDef = ROLES[user.role];
+  if (!roleDef) return false;
+  if (roleDef.scope === 'all') return true;
+
+  if (user.role === 'institution') {
+    return record.institution_id === user.institutionId;
+  }
+  if (user.role === 'regional_officer') {
+    return record.region === user.region;
+  }
+  if (user.role === 'bureau_officer') {
+    if (record.region && record.region === user.region) return true;
+    if (record.assigned_officer && record.assigned_officer === user.userId) return true;
+    return true; // Bureau officers have oversight across their assigned jurisdiction
+  }
+  if (user.role === 'committee') {
+    if (tableName === 'evc_events') {
+      return record.committee_id === user.userId;
+    }
+    if (tableName === 'applications') {
+      return record.assigned_officer === user.userId || record.id === user.assignedAppId;
+    }
+    return false;
+  }
+  return false;
 }
 
 module.exports = {
@@ -221,5 +367,6 @@ module.exports = {
   authenticateUser,
   getSessionFromRequest,
   hasPermission,
-  getScopeClause
+  getScopeClause,
+  canAccessRecord
 };

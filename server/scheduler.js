@@ -46,7 +46,7 @@ function createNotification(notif) {
     notif.entityId,
     notif.escalationLevel || 0,
     0,
-    'delivered',
+    'in_app',
     now
   );
 

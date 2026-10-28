@@ -35,15 +35,59 @@ const API = {
         headers
       });
 
-      const data = await res.json();
+      let data = {};
+      try {
+        data = await res.json();
+      } catch (e) {
+        data = { error: `Server returned invalid JSON response (status ${res.status})` };
+      }
+
       if (!res.ok) {
-        throw new Error(data.error || `HTTP error ${res.status}`);
+        const errorMsg = data.detail || data.error || data.title || `HTTP error ${res.status}`;
+        const err = new Error(errorMsg);
+        err.status = res.status;
+        err.problem = data;
+        throw err;
       }
       return data;
     } catch (err) {
-      console.warn(`[API] Fallback for ${endpoint}:`, err.message);
+      console.warn(`[API] Error on ${endpoint}:`, err.message);
       throw err;
     }
+  },
+
+  // Secure File Upload Helper
+  async uploadFile(file) {
+    return new Promise((resolve, reject) => {
+      if (!file) return reject(new Error('No file selected'));
+      if (file.size > 10 * 1024 * 1024) {
+        return reject(new Error('File exceeds maximum allowed size of 10MB'));
+      }
+      const reader = new FileReader();
+      reader.onload = async () => {
+        try {
+          const res = await this.request('/api/upload', {
+            method: 'POST',
+            body: JSON.stringify({
+              fileName: file.name,
+              fileData: reader.result,
+              mimeType: file.type || 'application/octet-stream'
+            })
+          });
+          resolve(res);
+        } catch (err) {
+          reject(err);
+        }
+      };
+      reader.onerror = () => reject(new Error('Failed reading file from local storage'));
+      reader.readAsDataURL(file);
+    });
+  },
+
+  // Generate verified download link
+  getFileUrl(storedPath) {
+    if (!storedPath) return '#';
+    return `${this.baseUrl}/api/files/${encodeURIComponent(storedPath)}`;
   },
 
   // Auth
@@ -144,10 +188,10 @@ const API = {
     });
   },
 
-  async submitEvidence(id, fileName, notes) {
+  async submitEvidence(id, fileName, storedPath, notes) {
     return this.request(`/api/undertakings/${id}/submit-evidence`, {
       method: 'POST',
-      body: JSON.stringify({ fileName, notes })
+      body: JSON.stringify({ fileName, storedPath, notes })
     });
   },
 
@@ -170,10 +214,10 @@ const API = {
     });
   },
 
-  async renewDocument(id, issueDate, expiryDate, fileName) {
+  async renewDocument(id, issueDate, expiryDate, fileName, storedPath) {
     return this.request(`/api/documents/${id}/renew`, {
       method: 'POST',
-      body: JSON.stringify({ issueDate, expiryDate, fileName })
+      body: JSON.stringify({ issueDate, expiryDate, fileName, storedPath })
     });
   },
 
@@ -208,6 +252,23 @@ const API = {
   // Audit
   async getAudits() {
     return this.request('/api/audit');
+  },
+
+  // Admin
+  async getAdminWorkflows() {
+    return this.request('/api/admin/workflows');
+  },
+
+  async getAdminUsers() {
+    return this.request('/api/admin/users');
+  },
+
+  async getAdminEscalationRules() {
+    return this.request('/api/admin/escalation-rules');
+  },
+
+  async resetSeedData() {
+    return this.request('/api/admin/reset-seed', { method: 'POST' });
   },
 
   // Scheduler

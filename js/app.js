@@ -1,23 +1,27 @@
 /* ============================================
    AICTE FlowGuard — Main Application Bootstrapper
+   Synchronized directly with SQLite Backend
    ============================================ */
 
 const App = {
-  init() {
-    // 1. Initialize Seed Data if first run
-    SeedData.seed();
-
-    // 2. Initialize Theme
+  async init() {
+    // 1. Initialize Theme
     this.initTheme();
 
-    // 3. Setup Global UI Event Listeners
+    // 2. Setup Global UI Event Listeners
     this.setupEventListeners();
 
-    // 4. Check Auth & Load Page
-    if (Auth.isLoggedIn()) {
-      this.showApp();
-      Router.navigate('dashboard');
-    } else {
+    // 3. Check Session with Server
+    try {
+      const user = await Auth.checkSession();
+      if (user) {
+        await Store.loadAll();
+        this.showApp();
+        Router.navigate('dashboard');
+      } else {
+        this.showLogin();
+      }
+    } catch (e) {
       this.showLogin();
     }
   },
@@ -47,23 +51,39 @@ const App = {
   },
 
   setupEventListeners() {
-    // Login form
+    // Login form submit handler
     const loginForm = document.getElementById('login-form');
     if (loginForm) {
-      loginForm.addEventListener('submit', (e) => {
+      loginForm.addEventListener('submit', async (e) => {
         e.preventDefault();
+        const submitBtn = document.getElementById('login-btn');
         const usernameInput = document.getElementById('login-username');
         const passwordInput = document.getElementById('login-password');
         const errorDiv = document.getElementById('login-error');
 
-        const result = Auth.login(usernameInput.value.trim(), passwordInput.value);
-        if (result.success) {
-          errorDiv.textContent = '';
-          this.showApp();
-          Router.navigate('dashboard');
-          Components.showToast(`Welcome back, ${result.session.fullName}!`, 'success', 'Signed In');
-        } else {
-          errorDiv.textContent = result.error;
+        if (submitBtn) {
+          submitBtn.disabled = true;
+          submitBtn.innerHTML = '<span class="spinner" style="width:16px;height:16px;display:inline-block;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:spin 0.8s linear infinite;vertical-align:middle;margin-right:6px;"></span> Signing In...';
+        }
+
+        try {
+          const result = await Auth.login(usernameInput.value.trim(), passwordInput.value);
+          if (result.success) {
+            if (errorDiv) errorDiv.textContent = '';
+            await Store.loadAll();
+            this.showApp();
+            Router.navigate('dashboard');
+            Components.showToast(`Welcome back, ${result.session.fullName}!`, 'success', 'Signed In');
+          } else {
+            if (errorDiv) errorDiv.textContent = result.error;
+          }
+        } catch (err) {
+          if (errorDiv) errorDiv.textContent = err.message || 'Unable to connect to server';
+        } finally {
+          if (submitBtn) {
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = '<span class="material-icons-round">login</span> Sign In';
+          }
         }
       });
     }
@@ -169,18 +189,16 @@ const App = {
           const query = globalSearch.value.trim().toLowerCase();
           if (!query) return;
 
-          // Search in applications
           const apps = Auth.filterByScope(Store.getAll('applications'), 'application');
-          const matched = apps.find(a => 
-            a.applicationNumber.toLowerCase().includes(query) ||
-            a.institutionName.toLowerCase().includes(query)
+          const matched = apps.find(a =>
+            (a.applicationNumber || a.application_number || '').toLowerCase().includes(query) ||
+            (a.institutionName || a.institution_name || '').toLowerCase().includes(query)
           );
 
           if (matched) {
             Router.navigate('application-detail', { id: matched.id });
             globalSearch.value = '';
           } else {
-            // Navigate to applications page with filter
             ApplicationsPage.filters.search = query;
             Router.navigate('applications');
           }
@@ -207,18 +225,38 @@ const App = {
     `).join('');
   },
 
-  quickLogin(username, password) {
+  async quickLogin(username, password) {
     const usernameInput = document.getElementById('login-username');
     const passwordInput = document.getElementById('login-password');
+    const errorDiv = document.getElementById('login-error');
     if (usernameInput && passwordInput) {
       usernameInput.value = username;
       passwordInput.value = password;
-      const result = Auth.login(username, password);
-      if (result.success) {
-        document.getElementById('login-error').textContent = '';
-        this.showApp();
-        Router.navigate('dashboard');
-        Components.showToast(`Logged in as ${result.session.fullName} (${Auth.ROLES[result.session.role]?.label || result.session.role})`, 'success');
+      if (errorDiv) errorDiv.textContent = '';
+
+      const submitBtn = document.getElementById('login-btn');
+      if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.innerHTML = '<span class="spinner" style="width:16px;height:16px;display:inline-block;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:spin 0.8s linear infinite;vertical-align:middle;margin-right:6px;"></span> Signing In...';
+      }
+
+      try {
+        const result = await Auth.login(username, password);
+        if (result.success) {
+          await Store.loadAll();
+          this.showApp();
+          Router.navigate('dashboard');
+          Components.showToast(`Logged in as ${result.session.fullName} (${Auth.ROLES[result.session.role]?.label || result.session.role})`, 'success');
+        } else {
+          if (errorDiv) errorDiv.textContent = result.error;
+        }
+      } catch (err) {
+        if (errorDiv) errorDiv.textContent = err.message || 'Login failed';
+      } finally {
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          submitBtn.innerHTML = '<span class="material-icons-round">login</span> Sign In';
+        }
       }
     }
   },
@@ -275,8 +313,8 @@ const App = {
     Components.updateNotificationBadge();
   },
 
-  logout() {
-    Auth.logout();
+  async logout() {
+    await Auth.logout();
     Components.showToast('You have been signed out successfully.', 'info');
     this.showLogin();
   }

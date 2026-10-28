@@ -5,7 +5,7 @@
 const AdminPage = {
   currentTab: 'workflows',
 
-  render() {
+  async render() {
     const container = document.getElementById('page-container');
     const session = Auth.getSession();
 
@@ -21,6 +21,14 @@ const AdminPage = {
         </div>
       `;
       return;
+    }
+
+    container.innerHTML = Components.renderLoadingState('Loading administrative settings...');
+
+    try {
+      await Store.loadAll();
+    } catch (err) {
+      console.error('Failed to load admin data:', err);
     }
 
     const templates = Store.getAll('workflowTemplates');
@@ -517,11 +525,16 @@ const AdminPage = {
     this.render();
   },
 
-  resetDemoData() {
-    if (confirm('Are you sure you want to restore all collections to initial demo seed data? All recent changes will be reset.')) {
-      SeedData.reset();
-      Components.showToast('Demo data re-seeded successfully!', 'success');
-      setTimeout(() => location.reload(), 800);
+  async resetDemoData() {
+    if (confirm('Are you sure you want to restore all SQLite collections to initial demo seed data? All recent changes will be reset.')) {
+      try {
+        await API.resetSeedData();
+        await Store.loadAll();
+        Components.showToast('Demo data re-seeded successfully on server!', 'success');
+        await this.render();
+      } catch (err) {
+        Components.showToast(err.message || 'Failed to reset seed data', 'error');
+      }
     }
   },
 
@@ -535,13 +548,15 @@ const AdminPage = {
       } else {
         Components.showToast('SLA due-date scan complete.', 'success');
       }
+      await Store.loadAll();
+      await this.render();
     } catch (e) {
-      Components.showToast('SLA scan complete (Local simulation mode).', 'success');
+      Components.showToast(e.message || 'SLA scan failed.', 'error');
     }
   },
 
   clearAllStorage() {
-    if (confirm('Clear all FlowGuard localStorage? You will need to log in again.')) {
+    if (confirm('Clear local session cache? You will need to log in again.')) {
       Store.clearAll();
       Store.clearSession();
       location.reload();

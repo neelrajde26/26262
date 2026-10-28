@@ -1,37 +1,38 @@
 /* ============================================
    AICTE FlowGuard — Authentication & Authorization
+   Connected directly to Backend JWT & REST API
    ============================================ */
 
 const Auth = {
-  // Role definitions with permissions
+  // Role definitions with fine-grained permissions and navigation rules
   ROLES: {
     institution: {
       label: 'Institution User',
-      permissions: ['view_own_applications', 'submit_application', 'view_own_undertakings', 'submit_evidence', 'view_own_documents', 'view_own_notifications'],
+      permissions: ['view_own_applications', 'submit_application', 'view_own_undertakings', 'submit_evidence', 'view_own_documents', 'upload_document', 'renew_document', 'view_own_notifications'],
       navItems: ['dashboard', 'applications', 'undertakings', 'documents', 'notifications'],
-      dataScope: 'institution', // Can only see own institution data
+      dataScope: 'institution',
     },
     regional_officer: {
       label: 'Regional Officer',
-      permissions: ['view_region_applications', 'review_application', 'advance_stage', 'return_application', 'review_undertaking', 'review_document', 'view_region_notifications', 'view_region_reports', 'view_evc'],
+      permissions: ['view_region_applications', 'review_application', 'advance_stage', 'return_application', 'review_undertaking', 'assign_undertaking', 'review_document', 'verify_document', 'view_region_notifications', 'view_region_reports', 'view_evc', 'manage_evc', 'view_audit'],
       navItems: ['dashboard', 'applications', 'evc', 'undertakings', 'documents', 'notifications', 'reports', 'audit'],
       dataScope: 'region',
     },
     bureau_officer: {
       label: 'Bureau Officer',
-      permissions: ['view_region_applications', 'view_all_applications', 'review_application', 'advance_stage', 'return_application', 'review_undertaking', 'review_document', 'view_all_notifications', 'view_all_reports', 'view_evc', 'manage_evc'],
+      permissions: ['view_region_applications', 'view_all_applications', 'review_application', 'advance_stage', 'return_application', 'review_undertaking', 'assign_undertaking', 'review_document', 'verify_document', 'view_all_notifications', 'view_all_reports', 'view_evc', 'manage_evc', 'view_audit'],
       navItems: ['dashboard', 'applications', 'evc', 'undertakings', 'documents', 'notifications', 'reports', 'audit'],
       dataScope: 'bureau',
     },
     committee: {
-      label: 'Committee / EVC Member',
+      label: 'Committee / EVC Expert',
       permissions: ['view_assigned_applications', 'view_evc', 'manage_evc', 'submit_evc_report', 'view_assigned_notifications'],
       navItems: ['dashboard', 'applications', 'evc', 'notifications'],
       dataScope: 'assigned',
     },
     competent_authority: {
       label: 'Competent Authority',
-      permissions: ['view_all_applications', 'approve_application', 'reject_application', 'view_all_reports', 'view_all_notifications', 'view_evc', 'view_escalations'],
+      permissions: ['view_all_applications', 'approve_application', 'reject_application', 'view_all_reports', 'view_all_notifications', 'view_evc', 'view_audit', 'view_escalations'],
       navItems: ['dashboard', 'applications', 'evc', 'undertakings', 'documents', 'notifications', 'reports', 'audit'],
       dataScope: 'all',
     },
@@ -43,64 +44,61 @@ const Auth = {
     },
   },
 
-  // Authenticate user
-  login(username, password) {
-    const users = Store.getAll('users');
-    const user = users.find(u => u.username === username && u.active);
-    if (!user) return { success: false, error: 'Invalid username or account inactive.' };
-
-    const hash = Utils.simpleHash(password);
-    if (user.passwordHash !== hash) return { success: false, error: 'Invalid password.' };
-
-    const session = {
-      userId: user.id,
-      username: user.username,
-      fullName: user.fullName,
-      role: user.role,
-      region: user.region,
-      institutionId: user.institutionId,
-      bureau: user.bureau,
-      committeeType: user.committeeType,
-      loginAt: Utils.now(),
-    };
-
-    Store.setSession(session);
-
-    // Audit login
-    Store.addAudit({
-      actor: user.id,
-      actorName: user.fullName,
-      action: 'user_login',
-      entityType: 'user',
-      entityId: user.id,
-      details: `${user.fullName} logged in as ${this.ROLES[user.role]?.label || user.role}`,
-    });
-
-    return { success: true, session };
-  },
-
-  logout() {
-    const session = Store.getSession();
-    if (session) {
-      Store.addAudit({
-        actor: session.userId,
-        actorName: session.fullName,
-        action: 'user_logout',
-        entityType: 'user',
-        entityId: session.userId,
-        details: `${session.fullName} logged out`,
-      });
+  // Authenticate user via Backend REST API
+  async login(username, password) {
+    try {
+      const data = await API.login(username, password);
+      if (data && data.success && data.user) {
+        Store.setSession(data.user);
+        return { success: true, session: data.user, token: data.token };
+      }
+      return { success: false, error: data.error || 'Authentication failed' };
+    } catch (err) {
+      return { success: false, error: err.message || 'Login failed. Please check your credentials.' };
     }
-    Store.clearSession();
   },
 
-  // Get current session
+  // Terminate session
+  async logout() {
+    try {
+      await API.logout();
+    } catch (err) {
+      console.warn('Logout network notice:', err.message);
+    } finally {
+      Store.clearSession();
+      API.setToken(null);
+    }
+  },
+
+  // Check and sync session with backend
+  async checkSession() {
+    const token = API.getToken();
+    if (!token) {
+      Store.clearSession();
+      return null;
+    }
+    try {
+      const data = await API.getMe();
+      if (data && data.user) {
+        Store.setSession(data.user);
+        return data.user;
+      }
+      Store.clearSession();
+      return null;
+    } catch (err) {
+      Store.clearSession();
+      API.setToken(null);
+      return null;
+    }
+  },
+
+  // Get current active session
   getSession() {
     return Store.getSession();
   },
 
   isLoggedIn() {
-    return !!Store.getSession();
+    return !!this.getSession() && !!API.getToken();
   },
 
   // Check permission
@@ -121,8 +119,9 @@ const Auth = {
     return roleDef.navItems.includes(navId);
   },
 
-  // Filter data by user's scope
+  // Defense-in-depth client-side scope filter
   filterByScope(items, entityType) {
+    if (!Array.isArray(items)) return [];
     const session = this.getSession();
     if (!session) return [];
     const roleDef = this.ROLES[session.role];
@@ -132,15 +131,13 @@ const Auth = {
       case 'all':
         return items;
       case 'institution':
-        return items.filter(item => item.institutionId === session.institutionId);
+        return items.filter(item => (item.institutionId || item.institution_id) === session.institutionId);
       case 'region':
         return items.filter(item => item.region === session.region);
       case 'bureau':
-        // Bureau officers can see their region plus cross-region cases assigned to them
-        return items.filter(item => item.region === session.region || item.assignedOfficer === session.userId);
+        return items.filter(item => item.region === session.region || (item.assignedOfficer || item.assigned_officer) === session.userId);
       case 'assigned':
-        // Committee members see only assigned cases
-        return items.filter(item => item.assignedOfficer === session.userId || item.committeeId === session.userId);
+        return items.filter(item => (item.assignedOfficer || item.assigned_officer) === session.userId || (item.committeeId || item.committee_id) === session.userId);
       default:
         return [];
     }
@@ -153,15 +150,21 @@ const Auth = {
 
     switch (action) {
       case 'advance':
+        if (session.role === 'regional_officer') {
+          return this.hasPermission('advance_stage') && application?.region === session.region;
+        }
         return this.hasPermission('advance_stage') || this.hasPermission('approve_application');
       case 'return':
+        if (session.role === 'regional_officer') {
+          return this.hasPermission('return_application') && application?.region === session.region;
+        }
         return this.hasPermission('return_application');
       case 'approve':
         return this.hasPermission('approve_application');
       case 'reject':
         return this.hasPermission('reject_application');
       case 'submit_evidence':
-        return this.hasPermission('submit_evidence') && application?.institutionId === session.institutionId;
+        return this.hasPermission('submit_evidence') && (application?.institutionId || application?.institution_id) === session.institutionId;
       case 'review_undertaking':
         return this.hasPermission('review_undertaking');
       case 'review_document':
@@ -173,16 +176,17 @@ const Auth = {
     }
   },
 
-  // Get demo accounts for display
+  // Verified seeded demo accounts
   getDemoAccounts() {
     return [
-      { username: 'inst_demotech', password: 'demo123', name: 'Rajesh Sharma', role: 'Institution User', desc: 'Demo Technical Institute' },
-      { username: 'ro_north', password: 'demo123', name: 'Dr. Priya Mehta', role: 'Regional Officer (North)', desc: 'Northern Region oversight' },
-      { username: 'ro_south', password: 'demo123', name: 'Dr. Suresh Kumar', role: 'Regional Officer (South)', desc: 'Southern Region oversight' },
-      { username: 'bo_bureau1', password: 'demo123', name: 'Ananya Gupta', role: 'Bureau Officer', desc: 'Engineering bureau' },
-      { username: 'evc_expert1', password: 'demo123', name: 'Prof. K. Ramachandran', role: 'Committee / EVC', desc: 'Expert Visit Committee' },
-      { username: 'ca_authority', password: 'demo123', name: 'Dr. Meera Joshi', role: 'Competent Authority', desc: 'Approval decisions' },
-      { username: 'admin', password: 'demo123', name: 'System Administrator', role: 'Admin', desc: 'System management' },
+      { username: 'ro_north', password: 'demo123', name: 'Dr. Priya Mehta', role: 'Regional Officer (North)', desc: 'Northern Region approval oversight' },
+      { username: 'ro_south', password: 'demo123', name: 'Dr. Suresh Kumar', role: 'Regional Officer (South)', desc: 'Southern Region approval oversight' },
+      { username: 'inst_demotech', password: 'demo123', name: 'Rajesh Sharma', role: 'Institution User', desc: 'Demo Institute of Technology (NR)' },
+      { username: 'inst_southeng', password: 'demo123', name: 'K. Balasubramanian', role: 'Institution User', desc: 'Southern Engineering College (SR)' },
+      { username: 'bo_bureau1', password: 'demo123', name: 'Ananya Gupta', role: 'Bureau Officer', desc: 'Engineering & Technology Bureau' },
+      { username: 'evc_expert1', password: 'demo123', name: 'Prof. K. Ramachandran', role: 'Committee / EVC Expert', desc: 'Expert Visit Committee Inspections' },
+      { username: 'ca_authority', password: 'demo123', name: 'Dr. Meera Joshi', role: 'Competent Authority', desc: 'AICTE Member Secretary Approval Orders' },
+      { username: 'admin', password: 'demo123', name: 'System Administrator', role: 'System Admin', desc: 'Platform Configuration & Schedulers' }
     ];
   }
 };

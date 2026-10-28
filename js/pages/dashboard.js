@@ -3,9 +3,18 @@
    ============================================ */
 
 const DashboardPage = {
-  render() {
+  async render() {
     const session = Auth.getSession();
     const container = document.getElementById('page-container');
+
+    container.innerHTML = Components.renderLoadingState('Loading dashboard intelligence...');
+
+    try {
+      await Store.loadAll();
+    } catch (err) {
+      console.error('Failed to load dashboard data:', err);
+    }
+
     const apps = Auth.filterByScope(Store.getAll('applications'), 'application');
     const undertakings = Auth.filterByScope(Store.getAll('undertakings'), 'undertaking');
     const documents = Auth.filterByScope(Store.getAll('documents'), 'document');

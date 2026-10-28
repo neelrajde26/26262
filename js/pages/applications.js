@@ -1,21 +1,36 @@
 /* ============================================
    AICTE FlowGuard — Applications List Page
+   Synchronized directly with SQLite Backend
    ============================================ */
 
 const ApplicationsPage = {
   currentPage: 1,
   filters: { status: '', region: '', type: '', search: '' },
 
-  render() {
+  async render() {
     const container = document.getElementById('page-container');
     const session = Auth.getSession();
 
-    // Get filtered & scoped data
+    // Render loading feedback
+    container.innerHTML = Components.renderLoadingState('Fetching live applications from AICTE FlowGuard database...');
+
+    try {
+      await Store.fetchApplications();
+    } catch (err) {
+      container.innerHTML = Components.renderErrorState(
+        'Failed to Load Applications',
+        err.message || 'Error communicating with backend server',
+        'ApplicationsPage.render()'
+      );
+      return;
+    }
+
+    // Get scoped applications from Store
     let apps = Auth.filterByScope(Store.getAll('applications'), 'application');
     apps = this.applyFilters(apps);
 
     // Sort by submission date, newest first
-    apps.sort((a, b) => new Date(b.submittedDate) - new Date(a.submittedDate));
+    apps.sort((a, b) => new Date(b.submittedDate || b.submitted_date) - new Date(a.submittedDate || a.submitted_date));
 
     const pagination = Utils.paginate(apps, this.currentPage, 10);
     const regions = Store.getAll('regions');
@@ -23,8 +38,8 @@ const ApplicationsPage = {
     container.innerHTML = `
       <div class="app-list-header">
         <div>
-          <h3 style="font-size: var(--font-size-lg); margin-bottom: var(--space-1);">Applications</h3>
-          <p style="font-size: var(--font-size-sm); color: var(--text-secondary);">${apps.length} application${apps.length !== 1 ? 's' : ''} found</p>
+          <h3 style="font-size: var(--font-size-lg); margin-bottom: var(--space-1); font-weight: 600;">Applications</h3>
+          <p style="font-size: var(--font-size-sm); color: var(--text-secondary);">${apps.length} application${apps.length !== 1 ? 's' : ''} in your active jurisdiction</p>
         </div>
         ${session.role === 'institution' ?
           `<button class="btn btn-primary" onclick="ApplicationsPage.showNewApplicationModal()">
@@ -36,7 +51,7 @@ const ApplicationsPage = {
       <!-- Filters -->
       <div class="filters-bar" style="margin-bottom: var(--space-4);">
         <span class="material-icons-round" style="color: var(--text-tertiary);">filter_list</span>
-        <input type="search" class="form-input" placeholder="Search by ID or institution..."
+        <input type="search" class="form-input" placeholder="Search by ID, program, institution..."
           value="${Utils.escapeHtml(this.filters.search)}"
           oninput="ApplicationsPage.onFilterChange('search', this.value)"
           id="app-filter-search">
@@ -76,14 +91,14 @@ const ApplicationsPage = {
                 <th>Institution</th>
                 <th>Type</th>
                 <th>Stage</th>
-                <th>Assigned To</th>
-                <th>Due Date</th>
+                <th>Assigned Officer</th>
+                <th>SLA Due Date</th>
                 <th>Age</th>
               </tr>
             </thead>
             <tbody>
               ${pagination.items.length === 0 ?
-                `<tr><td colspan="7"><div class="empty-state" style="padding: var(--space-6);"><span class="material-icons-round">search_off</span><h3>No applications found</h3><p>Try adjusting your filters.</p></div></td></tr>` :
+                `<tr><td colspan="7"><div class="empty-state" style="padding: var(--space-6);"><span class="material-icons-round">search_off</span><h3>No applications found</h3><p>No applications match the selected filter criteria.</p></div></td></tr>` :
                 pagination.items.map(a => this.renderRow(a)).join('')
               }
             </tbody>
@@ -91,16 +106,16 @@ const ApplicationsPage = {
         </div>
         ${Utils.paginationHtml(pagination, 'ApplicationsPage.goToPage')}
       </div>
-
-      <p style="margin-top: var(--space-4); font-size: var(--font-size-xs); color: var(--text-tertiary);">
-        ⚠ Demo data — all institutions, IDs, and dates are fictional.
-      </p>
     `;
   },
 
   renderRow(app) {
-    const days = app.submittedDate ? Utils.daysAgo(app.submittedDate) : 0;
-    const dueDate = app.currentStageDueDate;
+    const appNum = app.applicationNumber || app.application_number;
+    const instName = app.institutionName || app.institution_name;
+    const progName = app.programName || app.program_name || '';
+    const subDate = app.submittedDate || app.submitted_date;
+    const days = subDate ? Utils.daysAgo(subDate) : 0;
+    const dueDate = app.currentStageDueDate || app.current_stage_due_date;
     const dueDays = dueDate ? Utils.daysUntil(dueDate) : null;
     const isOverdue = dueDays !== null && dueDays < 0 && !['approved', 'rejected', 'cancelled'].includes(app.status);
     const isApproaching = dueDays !== null && dueDays >= 0 && dueDays <= 5 && !['approved', 'rejected', 'cancelled'].includes(app.status);
@@ -118,16 +133,16 @@ const ApplicationsPage = {
     return `
       <tr class="clickable" onclick="Router.navigate('application-detail', {id:'${app.id}'})">
         <td>
-          <div class="app-id-cell">${Utils.escapeHtml(app.applicationNumber)}</div>
-          ${app.isNewInstitution ? '<span class="badge badge-info" style="margin-top:2px"><span class="material-icons-round">star</span> New</span>' : ''}
+          <div class="app-id-cell">${Utils.escapeHtml(appNum)}</div>
+          ${app.isNewInstitution || app.is_new_institution ? '<span class="badge badge-info" style="margin-top:2px"><span class="material-icons-round">star</span> New</span>' : ''}
         </td>
         <td class="institution-cell">
-          <div class="institution-name">${Utils.escapeHtml(app.institutionName)}</div>
-          <div class="institution-location">${Utils.escapeHtml(app.programName || '')}</div>
+          <div class="institution-name">${Utils.escapeHtml(instName)}</div>
+          <div class="institution-location">${Utils.escapeHtml(progName)}</div>
         </td>
         <td><span class="badge badge-neutral">${Utils.escapeHtml(typeLabels[app.type] || app.type)}</span></td>
-        <td>${Utils.statusBadge(app.currentStage)}</td>
-        <td style="font-size: var(--font-size-sm)">${Utils.escapeHtml(app.assignedOfficerName || '—')}</td>
+        <td>${Utils.statusBadge(app.currentStage || app.current_stage)}</td>
+        <td style="font-size: var(--font-size-sm)">${Utils.escapeHtml(app.assignedOfficerName || app.assigned_officer_name || '—')}</td>
         <td>
           ${dueDate && !['approved', 'rejected', 'cancelled'].includes(app.status) ?
             `<span class="${isOverdue ? 'overdue' : (isApproaching ? 'approaching' : '')}">${Utils.formatDate(dueDate)}</span>` :
@@ -144,14 +159,19 @@ const ApplicationsPage = {
 
   applyFilters(apps) {
     return apps.filter(a => {
-      if (this.filters.status && a.status !== this.filters.status) return false;
-      if (this.filters.region && a.region !== this.filters.region) return false;
-      if (this.filters.type && a.type !== this.filters.type) return false;
+      const status = a.status;
+      const region = a.region;
+      const type = a.type;
+      const appNum = (a.applicationNumber || a.application_number || '').toLowerCase();
+      const instName = (a.institutionName || a.institution_name || '').toLowerCase();
+      const progName = (a.programName || a.program_name || '').toLowerCase();
+
+      if (this.filters.status && status !== this.filters.status) return false;
+      if (this.filters.region && region !== this.filters.region) return false;
+      if (this.filters.type && type !== this.filters.type) return false;
       if (this.filters.search) {
         const q = this.filters.search.toLowerCase();
-        if (!a.applicationNumber.toLowerCase().includes(q) &&
-            !a.institutionName.toLowerCase().includes(q) &&
-            !(a.programName || '').toLowerCase().includes(q)) return false;
+        if (!appNum.includes(q) && !instName.includes(q) && !progName.includes(q)) return false;
       }
       return true;
     });
@@ -172,96 +192,81 @@ const ApplicationsPage = {
     const session = Auth.getSession();
     if (session.role !== 'institution') return;
 
-    const templates = Store.getAll('workflowTemplates');
-    Components.showModal('New Application', `
-      <p style="font-size: var(--font-size-sm); color: var(--text-tertiary); margin-bottom: var(--space-4);">
-        ⚠ Demo form — not a real application submission.
-      </p>
+    let templates = Store.getAll('workflowTemplates');
+    if (!templates.length) {
+      templates = [
+        { id: 'wf-scrutiny-evc-sac', name: 'Scrutiny + EVC + SAC' },
+        { id: 'wf-scrutiny-only', name: 'Scrutiny Only' }
+      ];
+    }
+
+    Components.showModal('File New AICTE Application', `
       <div class="form-group">
-        <label class="form-label">Application Type</label>
+        <label class="form-label">Application Type *</label>
         <select class="form-select" id="new-app-type">
-          <option value="new-program">New Program</option>
-          <option value="intake-change">Intake Change</option>
-          <option value="new-institution">New Institution</option>
+          <option value="new-program">New Program Introduction</option>
+          <option value="intake-change">Variation in Intake / Division Addition</option>
+          <option value="new-institution">Establishment of New Technical Institution</option>
+          <option value="show-cause">Compliance / Show Cause Verification</option>
         </select>
       </div>
       <div class="form-group">
-        <label class="form-label">Program / Subject</label>
-        <input type="text" class="form-input" id="new-app-program" placeholder="e.g., B.Tech Electrical Engineering">
+        <label class="form-label">Program / Specialization *</label>
+        <input type="text" class="form-input" id="new-app-program" placeholder="e.g. B.Tech Computer Science & Artificial Intelligence" required>
       </div>
       <div class="form-group">
-        <label class="form-label">Workflow Template</label>
+        <label class="form-label">Approval Workflow Pipeline *</label>
         <select class="form-select" id="new-app-workflow">
           ${templates.map(t => `<option value="${t.id}">${Utils.escapeHtml(t.name)}</option>`).join('')}
         </select>
       </div>
       <div class="form-group">
-        <label class="form-label">Notes</label>
-        <textarea class="form-textarea" id="new-app-notes" placeholder="Additional notes..."></textarea>
+        <label class="form-label">Institutional Remarks / Brief</label>
+        <textarea class="form-textarea" id="new-app-notes" rows="3" placeholder="Provide background justification, proposed student intake, or land area details..."></textarea>
       </div>
     `, `
       <button class="btn btn-secondary" onclick="Components.closeModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="ApplicationsPage.submitNewApplication()">
-        <span class="material-icons-round">send</span> Submit Application
+      <button class="btn btn-primary" id="btn-submit-app" onclick="ApplicationsPage.submitNewApplication()">
+        <span class="material-icons-round">send</span> Submit Application to AICTE
       </button>
     `);
   },
 
-  submitNewApplication() {
-    const session = Auth.getSession();
+  async submitNewApplication() {
     const type = document.getElementById('new-app-type').value;
     const program = document.getElementById('new-app-program').value.trim();
     const workflowId = document.getElementById('new-app-workflow').value;
     const notes = document.getElementById('new-app-notes').value.trim();
 
     if (!program) {
-      Components.showToast('Please enter a program name', 'error');
+      Components.showToast('Please enter the program or specialization name', 'error');
       return;
     }
 
-    const institution = Store.getById('institutions', session.institutionId);
-    const region = institution?.region || session.region;
-    const regionCode = Store.getById('regions', region)?.code || 'XX';
-    const year = new Date().getFullYear();
-    const seq = String(Store.count('applications') + 1).padStart(4, '0');
+    const submitBtn = document.getElementById('btn-submit-app');
+    if (submitBtn) {
+      submitBtn.disabled = true;
+      submitBtn.innerHTML = '<span class="spinner" style="width:14px;height:14px;display:inline-block;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:spin 0.8s linear infinite;margin-right:6px;"></span> Submitting...';
+    }
 
-    const template = Store.getById('workflowTemplates', workflowId);
-    const firstStage = template?.stages?.[0]?.id || 'scrutiny';
+    try {
+      const res = await Store.createApplication({
+        type,
+        programName: program,
+        workflowTemplateId: workflowId,
+        notes
+      });
 
-    const app = Store.create('applications', {
-      applicationNumber: `FG/${regionCode}/${year}/${seq}`,
-      institutionId: session.institutionId,
-      institutionName: institution?.name || 'Unknown',
-      type,
-      programName: program,
-      workflowTemplateId: workflowId,
-      currentStage: firstStage,
-      status: firstStage,
-      region,
-      assignedOfficer: null,
-      assignedOfficerName: null,
-      submittedDate: Utils.today(),
-      currentStageDueDate: Utils.dateOffset(template?.stages?.[0]?.timelineDays || 15),
-      stageHistory: [
-        { stage: 'submitted', date: Utils.now(), actor: session.userId, actorName: session.fullName, action: 'Application submitted', notes: notes || '' },
-      ],
-      observations: notes,
-      attachments: ['application_form.pdf'],
-      priority: type === 'new-institution' ? 'high' : 'normal',
-      isNewInstitution: type === 'new-institution',
-    });
-
-    Store.addAudit({
-      actor: session.userId,
-      actorName: session.fullName,
-      action: 'application_submitted',
-      entityType: 'application',
-      entityId: app.id,
-      details: `New ${type} application submitted: ${program}`,
-    });
-
-    Components.closeModal();
-    Components.showToast('Application submitted successfully', 'success', 'Application Created');
-    this.render();
+      Components.closeModal();
+      Components.showToast(`Application ${res.applicationNumber} filed successfully on SQLite backend!`, 'success', 'Application Submitted');
+      await this.render();
+    } catch (err) {
+      Components.showToast(err.message || 'Submission failed', 'error', 'Error');
+    } finally {
+      if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = '<span class="material-icons-round">send</span> Submit Application';
+      }
+    }
   }
 };

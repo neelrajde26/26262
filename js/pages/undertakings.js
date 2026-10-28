@@ -6,29 +6,29 @@ const UndertakingsPage = {
   currentFilter: 'all',
   searchQuery: '',
 
-  render() {
+  async render() {
     const container = document.getElementById('page-container');
     const session = Auth.getSession();
     const isInstitution = session?.role === 'institution';
     const canReview = Auth.hasPermission('review_undertaking');
     const canCreate = ['admin', 'regional_officer', 'bureau_officer'].includes(session?.role);
 
+    container.innerHTML = Components.renderLoadingState('Loading compliance undertakings...');
+
+    try {
+      await Store.fetchUndertakings();
+    } catch (err) {
+      console.error('Failed to load undertakings:', err);
+    }
+
     let undertakings = Store.getAll('undertakings');
     undertakings = Auth.filterByScope(undertakings, 'undertaking');
-
-    // Update overdue status dynamically
-    undertakings.forEach(u => {
-      if (u.dueDate && Utils.daysUntil(u.dueDate) < 0 && u.status === 'pending') {
-        u.status = 'overdue';
-        Store.update('undertakings', u.id, { status: 'overdue' });
-      }
-    });
 
     const total = undertakings.length;
     const pending = undertakings.filter(u => u.status === 'pending').length;
     const submitted = undertakings.filter(u => u.status === 'submitted').length;
     const verified = undertakings.filter(u => u.status === 'verified').length;
-    const overdue = undertakings.filter(u => u.status === 'overdue').length;
+    const overdue = undertakings.filter(u => u.status === 'overdue' || (u.dueDate && Utils.daysUntil(u.dueDate) < 0 && u.status === 'pending')).length;
 
     // Filter list
     const filtered = undertakings.filter(u => {
@@ -139,7 +139,6 @@ const UndertakingsPage = {
             const dueDays = Utils.daysUntil(und.dueDate);
             const isLate = dueDays < 0;
             const submissions = und.submissions || [];
-            const latestSub = submissions.length > 0 ? submissions[submissions.length - 1] : null;
 
             return `
               <div class="card undertaking-card ${und.status === 'overdue' ? 'overdue-card' : ''}" style="${und.status === 'overdue' ? 'border-left-color: var(--color-danger-500);' : ''}">
@@ -182,21 +181,28 @@ const UndertakingsPage = {
                   ${submissions.length > 0 ? `
                     <div class="evidence-list">
                       <strong style="font-size: var(--font-size-xs); color: var(--text-secondary); text-transform: uppercase;">Submitted Evidence History:</strong>
-                      ${submissions.map((sub, i) => `
-                        <div class="evidence-item" style="margin-top: var(--space-2);">
-                          <div class="evidence-file">
+                      ${submissions.map((sub) => {
+                        const filePath = sub.storedPath || sub.stored_path;
+                        return `
+                        <div class="evidence-item" style="margin-top: var(--space-2); display: flex; justify-content: space-between; align-items: center;">
+                          <div class="evidence-file" style="display: flex; align-items: center; gap: var(--space-2);">
                             <span class="material-icons-round">description</span>
                             <div>
-                              <div style="font-weight: var(--font-weight-medium);">${Utils.escapeHtml(sub.fileName)}</div>
-                              <div style="font-size: var(--font-size-xs); color: var(--text-tertiary);">Submitted by ${Utils.escapeHtml(sub.submitterName)} • ${Utils.formatDateTime(sub.submittedAt)}</div>
-                              ${sub.reviewNotes ? `<div style="font-size: var(--font-size-xs); color: var(--color-warning-800); margin-top: 2px;"><strong>Review:</strong> ${Utils.escapeHtml(sub.reviewNotes)}</div>` : ''}
+                              <div style="font-weight: var(--font-weight-medium);">${Utils.escapeHtml(sub.fileName || sub.file_name)}</div>
+                              <div style="font-size: var(--font-size-xs); color: var(--text-tertiary);">Submitted by ${Utils.escapeHtml(sub.submitterName || sub.submitter_name || 'Staff')} • ${Utils.formatDateTime(sub.submittedAt || sub.submitted_at)}</div>
+                              ${sub.reviewNotes || sub.review_notes ? `<div style="font-size: var(--font-size-xs); color: var(--color-warning-800); margin-top: 2px;"><strong>Review:</strong> ${Utils.escapeHtml(sub.reviewNotes || sub.review_notes)}</div>` : ''}
                             </div>
                           </div>
-                          <div>
+                          <div style="display: flex; align-items: center; gap: var(--space-2);">
+                            ${filePath ? `
+                              <a href="${API.getFileUrl(filePath)}" target="_blank" class="btn btn-ghost btn-xs" title="Download Evidence File">
+                                <span class="material-icons-round">download</span> File
+                              </a>
+                            ` : ''}
                             ${Utils.statusBadge(sub.status)}
                           </div>
                         </div>
-                      `).join('')}
+                      `;}).join('')}
                     </div>
                   ` : `
                     <div style="font-size: var(--font-size-xs); color: var(--text-tertiary); font-style: italic; margin-top: var(--space-2);">
@@ -249,7 +255,7 @@ const UndertakingsPage = {
     const officers = Store.getAll('users').filter(u => ['regional_officer', 'bureau_officer'].includes(u.role));
 
     const bodyHtml = `
-      <form id="add-undertaking-form">
+      <form id="add-undertaking-form" onsubmit="event.preventDefault(); UndertakingsPage.handleAddSubmit();">
         <div class="form-group">
           <label class="form-label">Institution *</label>
           <select id="modal-und-inst" class="form-input" required>
@@ -280,7 +286,7 @@ const UndertakingsPage = {
 
     const footerHtml = `
       <button class="btn btn-ghost" onclick="Components.closeModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="UndertakingsPage.handleAddSubmit()">
+      <button class="btn btn-primary" id="btn-create-undertaking" onclick="UndertakingsPage.handleAddSubmit()">
         <span class="material-icons-round">check</span> Create Condition
       </button>
     `;
@@ -288,60 +294,43 @@ const UndertakingsPage = {
     Components.showModal('Assign Institutional Undertaking', bodyHtml, footerHtml);
   },
 
-  handleAddSubmit() {
+  async handleAddSubmit() {
     const instSelect = document.getElementById('modal-und-inst');
     const conditionInput = document.getElementById('modal-und-condition');
     const evidenceInput = document.getElementById('modal-und-evidence');
     const duedateInput = document.getElementById('modal-und-duedate');
     const ownerSelect = document.getElementById('modal-und-owner');
+    const btn = document.getElementById('btn-create-undertaking');
 
-    if (!instSelect.value || !conditionInput.value.trim() || !evidenceInput.value.trim() || !duedateInput.value) {
+    if (!instSelect || !instSelect.value || !conditionInput.value.trim() || !evidenceInput.value.trim() || !duedateInput.value) {
       Components.showToast('Please fill out all required fields.', 'warning');
       return;
     }
 
-    const inst = Store.getById('institutions', instSelect.value);
-    const owner = Store.getById('users', ownerSelect.value);
-    const session = Auth.getSession();
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = `<span class="spinner" style="width:16px;height:16px;border-width:2px;display:inline-block;vertical-align:middle;margin-right:6px;"></span> Creating...`;
+    }
 
-    const newUndertaking = {
-      institutionId: inst.id,
-      institutionName: inst.name,
-      condition: conditionInput.value.trim(),
-      requiredEvidence: evidenceInput.value.trim(),
-      dueDate: duedateInput.value,
-      verificationOwner: owner.id,
-      verificationOwnerName: owner.fullName,
-      status: 'pending',
-      region: inst.region,
-      submissions: []
-    };
+    try {
+      await Store.createUndertaking({
+        institutionId: instSelect.value,
+        condition: conditionInput.value.trim(),
+        requiredEvidence: evidenceInput.value.trim(),
+        dueDate: duedateInput.value,
+        verificationOwner: ownerSelect.value
+      });
 
-    const created = Store.create('undertakings', newUndertaking);
-
-    Store.addAudit({
-      actor: session.userId,
-      actorName: session.fullName,
-      action: 'undertaking_created',
-      entityType: 'undertaking',
-      entityId: created.id,
-      details: `Created compliance requirement for ${inst.name}: ${conditionInput.value.trim().substring(0, 50)}...`
-    });
-
-    // Notify institution
-    Store.addNotification({
-      type: 'deadline_approaching',
-      title: 'New Compliance Undertaking Assigned',
-      message: `A new undertaking has been assigned: "${conditionInput.value.trim().substring(0, 60)}..." Due on ${Utils.formatDate(duedateInput.value)}.`,
-      recipientInstitution: inst.id,
-      recipientRole: 'institution',
-      entityType: 'undertaking',
-      entityId: created.id,
-    });
-
-    Components.closeModal();
-    Components.showToast('Undertaking requirement recorded successfully!', 'success');
-    this.render();
+      Components.closeModal();
+      Components.showToast('Undertaking requirement recorded successfully!', 'success');
+      await this.render();
+    } catch (err) {
+      Components.showToast(err.message || 'Failed to create undertaking', 'error');
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = `<span class="material-icons-round">check</span> Create Condition`;
+      }
+    }
   },
 
   showSubmitEvidenceModal(undertakingId) {
@@ -349,7 +338,7 @@ const UndertakingsPage = {
     if (!und) return;
 
     const bodyHtml = `
-      <form id="submit-evidence-form">
+      <form id="submit-evidence-form" onsubmit="event.preventDefault(); UndertakingsPage.handleSubmitEvidenceSubmit('${undertakingId}');">
         <div class="form-group">
           <label class="form-label">Condition</label>
           <div style="font-weight: var(--font-weight-medium); padding: var(--space-2) 0;">${Utils.escapeHtml(und.condition)}</div>
@@ -359,7 +348,11 @@ const UndertakingsPage = {
           <div style="font-size: var(--font-size-xs); color: var(--text-secondary);">${Utils.escapeHtml(und.requiredEvidence)}</div>
         </div>
         <div class="form-group">
-          <label class="form-label">Select File / Document Name *</label>
+          <label class="form-label">Upload Evidence File (.pdf, .png, .jpg, .docx)</label>
+          <input type="file" id="modal-ev-file" class="form-input" accept=".pdf,.png,.jpg,.jpeg,.xlsx,.doc,.docx">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Evidence Document Label / Title *</label>
           <input type="text" id="modal-ev-filename" class="form-input" required placeholder="e.g. fire_safety_noc_signed_2026.pdf" value="compliance_proof_${Date.now().toString(36)}.pdf">
         </div>
         <div class="form-group">
@@ -371,7 +364,7 @@ const UndertakingsPage = {
 
     const footerHtml = `
       <button class="btn btn-ghost" onclick="Components.closeModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="UndertakingsPage.handleSubmitEvidenceSubmit('${undertakingId}')">
+      <button class="btn btn-primary" id="btn-submit-ev" onclick="UndertakingsPage.handleSubmitEvidenceSubmit('${undertakingId}')">
         <span class="material-icons-round">cloud_upload</span> Upload & Submit
       </button>
     `;
@@ -379,61 +372,37 @@ const UndertakingsPage = {
     Components.showModal('Submit Compliance Evidence', bodyHtml, footerHtml);
   },
 
-  handleSubmitEvidenceSubmit(undertakingId) {
+  async handleSubmitEvidenceSubmit(undertakingId) {
+    const fileInput = document.getElementById('modal-ev-file');
     const filenameInput = document.getElementById('modal-ev-filename');
     const notesInput = document.getElementById('modal-ev-notes');
+    const btn = document.getElementById('btn-submit-ev');
 
-    if (!filenameInput.value.trim()) {
-      Components.showToast('Please provide a file name.', 'warning');
+    const file = fileInput?.files?.[0];
+    const fileLabel = filenameInput ? filenameInput.value.trim() : '';
+
+    if (!file && !fileLabel) {
+      Components.showToast('Please provide a file or document title.', 'warning');
       return;
     }
 
-    const session = Auth.getSession();
-    const und = Store.getById('undertakings', undertakingId);
-    if (!und) return;
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = `<span class="spinner" style="width:16px;height:16px;border-width:2px;display:inline-block;vertical-align:middle;margin-right:6px;"></span> Uploading...`;
+    }
 
-    const submissions = und.submissions || [];
-    const newSubmission = {
-      id: Utils.generateId('sub'),
-      fileName: filenameInput.value.trim(),
-      submittedAt: Utils.now(),
-      submittedBy: session.userId,
-      submitterName: session.fullName,
-      status: 'under-review',
-      reviewNotes: notesInput.value.trim()
-    };
-
-    submissions.push(newSubmission);
-
-    Store.update('undertakings', undertakingId, {
-      status: 'submitted',
-      submissions
-    });
-
-    Store.addAudit({
-      actor: session.userId,
-      actorName: session.fullName,
-      action: 'evidence_submitted',
-      entityType: 'undertaking',
-      entityId: undertakingId,
-      details: `Submitted compliance evidence file: ${filenameInput.value.trim()}`
-    });
-
-    // Notify verification officer
-    Store.addNotification({
-      type: 'submission_received',
-      title: 'Compliance Evidence Submitted',
-      message: `${und.institutionName} has submitted evidence for condition: "${Utils.truncate(und.condition, 40)}"`,
-      recipientId: und.verificationOwner,
-      recipientRole: 'regional_officer',
-      recipientRegion: und.region,
-      entityType: 'undertaking',
-      entityId: undertakingId,
-    });
-
-    Components.closeModal();
-    Components.showToast('Evidence submitted successfully for verification!', 'success');
-    this.render();
+    try {
+      await Store.submitEvidence(undertakingId, file || fileLabel, notesInput ? notesInput.value.trim() : '');
+      Components.closeModal();
+      Components.showToast('Evidence submitted successfully for verification!', 'success');
+      await this.render();
+    } catch (err) {
+      Components.showToast(err.message || 'Failed to submit evidence', 'error');
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = `<span class="material-icons-round">cloud_upload</span> Upload & Submit`;
+      }
+    }
   },
 
   showReviewModal(undertakingId) {
@@ -450,13 +419,18 @@ const UndertakingsPage = {
         <p><strong>Required:</strong> ${Utils.escapeHtml(und.requiredEvidence)}</p>
         ${latestSub ? `
           <div style="background: var(--bg-tertiary); padding: var(--space-3); border-radius: var(--border-radius); margin-top: var(--space-2);">
-            <strong>Submitted File:</strong> ${Utils.escapeHtml(latestSub.fileName)}<br>
-            <strong>Date:</strong> ${Utils.formatDateTime(latestSub.submittedAt)} by ${Utils.escapeHtml(latestSub.submitterName)}
+            <strong>Submitted File:</strong> ${Utils.escapeHtml(latestSub.fileName || latestSub.file_name)}
+            ${(latestSub.storedPath || latestSub.stored_path) ? `
+              <a href="${API.getFileUrl(latestSub.storedPath || latestSub.stored_path)}" target="_blank" class="btn btn-ghost btn-xs" style="margin-left: 8px;">
+                <span class="material-icons-round">download</span> Download
+              </a>
+            ` : ''}<br>
+            <strong>Date:</strong> ${Utils.formatDateTime(latestSub.submittedAt || latestSub.submitted_at)} by ${Utils.escapeHtml(latestSub.submitterName || latestSub.submitter_name || 'Staff')}
           </div>
         ` : ''}
       </div>
 
-      <form id="review-undertaking-form">
+      <form id="review-undertaking-form" onsubmit="event.preventDefault(); UndertakingsPage.handleReviewSubmit('${undertakingId}');">
         <div class="form-group">
           <label class="form-label">Review Decision *</label>
           <select id="modal-review-decision" class="form-input" required>
@@ -474,7 +448,7 @@ const UndertakingsPage = {
 
     const footerHtml = `
       <button class="btn btn-ghost" onclick="Components.closeModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="UndertakingsPage.handleReviewSubmit('${undertakingId}')">
+      <button class="btn btn-primary" id="btn-save-review" onclick="UndertakingsPage.handleReviewSubmit('${undertakingId}')">
         <span class="material-icons-round">task_alt</span> Save Verification
       </button>
     `;
@@ -482,53 +456,34 @@ const UndertakingsPage = {
     Components.showModal('Review Compliance Undertaking', bodyHtml, footerHtml);
   },
 
-  handleReviewSubmit(undertakingId) {
+  async handleReviewSubmit(undertakingId) {
     const decisionSelect = document.getElementById('modal-review-decision');
     const notesInput = document.getElementById('modal-review-notes');
+    const btn = document.getElementById('btn-save-review');
 
-    if (!notesInput.value.trim()) {
+    if (!notesInput || !notesInput.value.trim()) {
       Components.showToast('Please provide verification remarks.', 'warning');
       return;
     }
 
-    const session = Auth.getSession();
-    const und = Store.getById('undertakings', undertakingId);
-    if (!und) return;
-
-    const decision = decisionSelect.value;
-    const submissions = und.submissions || [];
-    if (submissions.length > 0) {
-      submissions[submissions.length - 1].status = decision === 'verified' ? 'accepted' : decision;
-      submissions[submissions.length - 1].reviewNotes = notesInput.value.trim();
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = `<span class="spinner" style="width:16px;height:16px;border-width:2px;display:inline-block;vertical-align:middle;margin-right:6px;"></span> Saving...`;
     }
 
-    Store.update('undertakings', undertakingId, {
-      status: decision,
-      submissions
-    });
+    const decision = decisionSelect.value;
 
-    Store.addAudit({
-      actor: session.userId,
-      actorName: session.fullName,
-      action: 'undertaking_reviewed',
-      entityType: 'undertaking',
-      entityId: undertakingId,
-      details: `Compliance review completed for ${und.institutionName}: ${decision}. Remarks: ${notesInput.value.trim()}`
-    });
-
-    // Notify institution
-    Store.addNotification({
-      type: decision === 'verified' ? 'approved' : 'returned',
-      title: decision === 'verified' ? 'Compliance Verified' : 'Compliance Feedback / Return',
-      message: `Undertaking "${Utils.truncate(und.condition, 40)}" has been marked as ${decision}. ${notesInput.value.trim()}`,
-      recipientInstitution: und.institutionId,
-      recipientRole: 'institution',
-      entityType: 'undertaking',
-      entityId: undertakingId,
-    });
-
-    Components.closeModal();
-    Components.showToast(`Undertaking marked as ${decision}!`, 'success');
-    this.render();
+    try {
+      await Store.reviewUndertaking(undertakingId, decision, notesInput.value.trim());
+      Components.closeModal();
+      Components.showToast(`Undertaking marked as ${decision}!`, 'success');
+      await this.render();
+    } catch (err) {
+      Components.showToast(err.message || 'Failed to review undertaking', 'error');
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = `<span class="material-icons-round">task_alt</span> Save Verification`;
+      }
+    }
   }
 };

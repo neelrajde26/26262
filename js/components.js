@@ -303,5 +303,37 @@ const Components = {
         }).join('')}
       </div>
     `;
+  },
+
+  // State Feedback Renderers
+  renderLoadingState(message = 'Synchronizing with AICTE FlowGuard database...') {
+    return `
+      <div class="loading-state" role="status" aria-live="polite" style="display:flex; flex-direction:column; align-items:center; justify-content:center; padding: 60px 20px; gap: 16px;">
+        <div class="spinner" style="width: 38px; height: 38px; border: 3px solid var(--border-color); border-top-color: var(--color-primary); border-radius: 50%; animation: spin 0.8s linear infinite;"></div>
+        <p style="color: var(--text-secondary); font-size: var(--font-size-sm); font-weight: 500;">${Utils.escapeHtml(message)}</p>
+      </div>
+    `;
+  },
+
+  renderEmptyState(title = 'No records found', message = 'There are no active records in your jurisdiction.', icon = 'inbox') {
+    return `
+      <div class="empty-state" style="text-align:center; padding: 48px 24px;">
+        <span class="material-icons-round" style="font-size: 54px; color: var(--text-tertiary); margin-bottom: 12px; display:block;">${icon}</span>
+        <h3 style="font-size: var(--font-size-md); font-weight: 600; margin-bottom: 6px;">${Utils.escapeHtml(title)}</h3>
+        <p style="color: var(--text-secondary); font-size: var(--font-size-sm); max-width: 440px; margin: 0 auto;">${Utils.escapeHtml(message)}</p>
+      </div>
+    `;
+  },
+
+  renderErrorState(title = 'Connection Notice', message = 'Could not load data from the server.', retryCallbackStr = null) {
+    return `
+      <div class="empty-state" style="text-align:center; padding: 40px 24px; border: 1px solid var(--color-danger-100); border-radius: var(--radius-lg); background: var(--color-danger-50); margin: 20px 0;">
+        <span class="material-icons-round" style="font-size: 48px; color: var(--color-danger); margin-bottom: 10px; display:block;">error_outline</span>
+        <h3 style="color: var(--color-danger-700); font-size: var(--font-size-md); font-weight: 600; margin-bottom: 6px;">${Utils.escapeHtml(title)}</h3>
+        <p style="color: var(--text-secondary); font-size: var(--font-size-sm); max-width: 460px; margin: 0 auto 16px;">${Utils.escapeHtml(message)}</p>
+        ${retryCallbackStr ? `<button class="btn btn-outline btn-sm" onclick="${retryCallbackStr}"><span class="material-icons-round">refresh</span> Try Again</button>` : ''}
+      </div>
+    `;
   }
 };
+

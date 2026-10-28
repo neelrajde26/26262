@@ -7,28 +7,22 @@ const DocumentsPage = {
   currentType: '',
   searchQuery: '',
 
-  render() {
+  async render() {
     const container = document.getElementById('page-container');
     const session = Auth.getSession();
     const isInstitution = session?.role === 'institution';
     const canReview = Auth.hasPermission('review_document');
 
+    container.innerHTML = Components.renderLoadingState('Loading statutory documents...');
+
+    try {
+      await Store.fetchDocuments();
+    } catch (err) {
+      console.error('Failed to load documents:', err);
+    }
+
     let docs = Store.getAll('documents');
     docs = Auth.filterByScope(docs, 'document');
-
-    // Dynamically calculate expiry statuses
-    docs.forEach(doc => {
-      if (doc.expiryDate) {
-        const days = Utils.daysUntil(doc.expiryDate);
-        if (days < 0 && doc.status !== 'renewal-pending') {
-          doc.status = 'expired';
-          Store.update('documents', doc.id, { status: 'expired' });
-        } else if (days <= 60 && days >= 0 && doc.status !== 'renewal-pending') {
-          doc.status = 'expiring-soon';
-          Store.update('documents', doc.id, { status: 'expiring-soon' });
-        }
-      }
-    });
 
     const total = docs.length;
     const valid = docs.filter(d => d.status === 'valid').length;
@@ -174,6 +168,8 @@ const DocumentsPage = {
                     expiryBadge = `<span class="doc-expiry valid"><span class="material-icons-round" style="font-size:12px">check_circle</span> Valid (${days}d left)</span>`;
                   }
 
+                  const filePath = doc.storedPath || doc.stored_path;
+
                   return `
                     <tr>
                       <td>
@@ -186,7 +182,12 @@ const DocumentsPage = {
                       <td>
                         <div style="display: flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: var(--font-size-xs);">
                           <span class="material-icons-round" style="font-size: 16px; color: var(--color-primary-500);">picture_as_pdf</span>
-                          ${Utils.escapeHtml(doc.fileName)}
+                          <span>${Utils.escapeHtml(doc.fileName)}</span>
+                          ${filePath ? `
+                            <a href="${API.getFileUrl(filePath)}" target="_blank" class="btn btn-ghost btn-xs" title="Download Document File">
+                              <span class="material-icons-round">download</span>
+                            </a>
+                          ` : ''}
                         </div>
                       </td>
                       <td style="font-size: var(--font-size-sm);">${Utils.formatDate(doc.issueDate)}</td>
@@ -254,7 +255,7 @@ const DocumentsPage = {
     const institutions = Store.getAll('institutions');
 
     const bodyHtml = `
-      <form id="upload-doc-form">
+      <form id="upload-doc-form" onsubmit="event.preventDefault(); DocumentsPage.handleUploadSubmit();">
         ${session?.role !== 'institution' ? `
           <div class="form-group">
             <label class="form-label">Institution *</label>
@@ -288,7 +289,11 @@ const DocumentsPage = {
           <input type="date" id="modal-doc-expiry" class="form-input">
         </div>
         <div class="form-group">
-          <label class="form-label">File Name *</label>
+          <label class="form-label">Upload File (.pdf, .png, .jpg, .docx)</label>
+          <input type="file" id="modal-doc-file-input" class="form-input" accept=".pdf,.png,.jpg,.jpeg,.xlsx,.doc,.docx">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Document Display Name / Title *</label>
           <input type="text" id="modal-doc-filename" class="form-input" required value="doc_${Date.now().toString(36)}.pdf">
         </div>
       </form>
@@ -296,7 +301,7 @@ const DocumentsPage = {
 
     const footerHtml = `
       <button class="btn btn-ghost" onclick="Components.closeModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="DocumentsPage.handleUploadSubmit()">
+      <button class="btn btn-primary" id="btn-upload-doc" onclick="DocumentsPage.handleUploadSubmit()">
         <span class="material-icons-round">cloud_upload</span> Upload Document
       </button>
     `;
@@ -304,58 +309,54 @@ const DocumentsPage = {
     Components.showModal('Upload Statutory Document', bodyHtml, footerHtml);
   },
 
-  handleUploadSubmit() {
+  async handleUploadSubmit() {
     const session = Auth.getSession();
     const typeSelect = document.getElementById('modal-doc-type');
     const descInput = document.getElementById('modal-doc-desc');
     const issueInput = document.getElementById('modal-doc-issue');
     const expiryInput = document.getElementById('modal-doc-expiry');
-    const fileInput = document.getElementById('modal-doc-filename');
+    const nameInput = document.getElementById('modal-doc-filename');
+    const fileInput = document.getElementById('modal-doc-file-input');
+    const btn = document.getElementById('btn-upload-doc');
 
     let instId = session.institutionId;
     if (session.role !== 'institution') {
       const instSelect = document.getElementById('modal-doc-inst');
-      instId = instSelect.value;
+      instId = instSelect ? instSelect.value : null;
     }
 
-    if (!descInput.value.trim() || !issueInput.value || !fileInput.value.trim()) {
+    if (!descInput || !descInput.value.trim() || !issueInput || !issueInput.value || !nameInput || !nameInput.value.trim()) {
       Components.showToast('Please fill out all required fields.', 'warning');
       return;
     }
 
-    const inst = Store.getById('institutions', instId);
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = `<span class="spinner" style="width:16px;height:16px;border-width:2px;display:inline-block;vertical-align:middle;margin-right:6px;"></span> Uploading...`;
+    }
 
-    const newDoc = {
-      institutionId: inst.id,
-      institutionName: inst.name,
-      type: typeSelect.value,
-      description: descInput.value.trim(),
-      issueDate: issueInput.value,
-      effectiveDate: issueInput.value,
-      expiryDate: expiryInput.value || null,
-      status: 'valid',
-      fileName: fileInput.value.trim(),
-      region: inst.region,
-      renewalStatus: null,
-      verificationStatus: 'pending',
-      verifiedBy: null,
-      verifiedDate: null
-    };
+    const file = fileInput?.files?.[0];
 
-    const created = Store.create('documents', newDoc);
+    try {
+      await Store.createDocument({
+        institutionId: instId,
+        type: typeSelect.value,
+        description: descInput.value.trim(),
+        issueDate: issueInput.value,
+        expiryDate: expiryInput.value || null,
+        fileName: nameInput.value.trim()
+      }, file);
 
-    Store.addAudit({
-      actor: session.userId,
-      actorName: session.fullName,
-      action: 'document_uploaded',
-      entityType: 'document',
-      entityId: created.id,
-      details: `Uploaded ${typeSelect.value} for ${inst.name}: ${fileInput.value.trim()}`
-    });
-
-    Components.closeModal();
-    Components.showToast('Statutory document uploaded successfully!', 'success');
-    this.render();
+      Components.closeModal();
+      Components.showToast('Statutory document uploaded successfully!', 'success');
+      await this.render();
+    } catch (err) {
+      Components.showToast(err.message || 'Failed to upload document', 'error');
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = `<span class="material-icons-round">cloud_upload</span> Upload Document`;
+      }
+    }
   },
 
   showRenewModal(docId) {
@@ -363,7 +364,7 @@ const DocumentsPage = {
     if (!doc) return;
 
     const bodyHtml = `
-      <form id="renew-doc-form">
+      <form id="renew-doc-form" onsubmit="event.preventDefault(); DocumentsPage.handleRenewSubmit('${docId}');">
         <div class="form-group">
           <label class="form-label">Document</label>
           <div style="font-weight: var(--font-weight-medium);">${Utils.escapeHtml(doc.type)} — ${Utils.escapeHtml(doc.institutionName)}</div>
@@ -377,7 +378,11 @@ const DocumentsPage = {
           <input type="date" id="modal-renew-expiry" class="form-input" required value="${Utils.dateOffset(365)}" min="${Utils.today()}">
         </div>
         <div class="form-group">
-          <label class="form-label">New Renewed File Name *</label>
+          <label class="form-label">Upload Renewed File (.pdf, .png, .jpg, .docx)</label>
+          <input type="file" id="modal-renew-file-input" class="form-input" accept=".pdf,.png,.jpg,.jpeg,.xlsx,.doc,.docx">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Renewed Document Label / Title *</label>
           <input type="text" id="modal-renew-file" class="form-input" required value="renewed_${doc.fileName}">
         </div>
       </form>
@@ -385,7 +390,7 @@ const DocumentsPage = {
 
     const footerHtml = `
       <button class="btn btn-ghost" onclick="Components.closeModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="DocumentsPage.handleRenewSubmit('${docId}')">
+      <button class="btn btn-primary" id="btn-submit-renewal" onclick="DocumentsPage.handleRenewSubmit('${docId}')">
         <span class="material-icons-round">autorenew</span> Submit Renewal
       </button>
     `;
@@ -393,69 +398,54 @@ const DocumentsPage = {
     Components.showModal('Submit Document Renewal', bodyHtml, footerHtml);
   },
 
-  handleRenewSubmit(docId) {
+  async handleRenewSubmit(docId) {
     const issueInput = document.getElementById('modal-renew-issue');
     const expiryInput = document.getElementById('modal-renew-expiry');
-    const fileInput = document.getElementById('modal-renew-file');
+    const fileLabelInput = document.getElementById('modal-renew-file');
+    const fileInput = document.getElementById('modal-renew-file-input');
+    const btn = document.getElementById('btn-submit-renewal');
 
-    if (!issueInput.value || !expiryInput.value || !fileInput.value.trim()) {
+    if (!issueInput || !issueInput.value || !expiryInput || !expiryInput.value || !fileLabelInput || !fileLabelInput.value.trim()) {
       Components.showToast('Please fill all renewal details.', 'warning');
       return;
     }
 
-    const session = Auth.getSession();
-    const doc = Store.getById('documents', docId);
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = `<span class="spinner" style="width:16px;height:16px;border-width:2px;display:inline-block;vertical-align:middle;margin-right:6px;"></span> Submitting...`;
+    }
 
-    Store.update('documents', docId, {
-      issueDate: issueInput.value,
-      expiryDate: expiryInput.value,
-      fileName: fileInput.value.trim(),
-      status: 'valid',
-      renewalStatus: 'renewed',
-      verificationStatus: 'pending'
-    });
+    const file = fileInput?.files?.[0];
 
-    Store.addAudit({
-      actor: session.userId,
-      actorName: session.fullName,
-      action: 'document_renewed',
-      entityType: 'document',
-      entityId: docId,
-      details: `Renewed ${doc.type} for ${doc.institutionName}. New expiry: ${Utils.formatDate(expiryInput.value)}`
-    });
-
-    Components.closeModal();
-    Components.showToast('Document renewal submitted for verification!', 'success');
-    this.render();
+    try {
+      await Store.renewDocument(docId, issueInput.value, expiryInput.value, file || fileLabelInput.value.trim());
+      Components.closeModal();
+      Components.showToast('Document renewal submitted for verification!', 'success');
+      await this.render();
+    } catch (err) {
+      Components.showToast(err.message || 'Failed to submit renewal', 'error');
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = `<span class="material-icons-round">autorenew</span> Submit Renewal`;
+      }
+    }
   },
 
-  verifyDocument(docId) {
-    const session = Auth.getSession();
-    const doc = Store.getById('documents', docId);
-    if (!doc) return;
-
-    Store.update('documents', docId, {
-      verificationStatus: 'verified',
-      verifiedBy: session.userId,
-      verifiedDate: Utils.now()
-    });
-
-    Store.addAudit({
-      actor: session.userId,
-      actorName: session.fullName,
-      action: 'document_verified',
-      entityType: 'document',
-      entityId: docId,
-      details: `Verified statutory validity of ${doc.type} (${doc.fileName}) for ${doc.institutionName}`
-    });
-
-    Components.showToast('Document verified and confirmed valid!', 'success');
-    this.render();
+  async verifyDocument(docId) {
+    try {
+      await Store.verifyDocument(docId);
+      Components.showToast('Document verified and confirmed valid!', 'success');
+      await this.render();
+    } catch (err) {
+      Components.showToast(err.message || 'Failed to verify document', 'error');
+    }
   },
 
   showDetailsModal(docId) {
     const doc = Store.getById('documents', docId);
     if (!doc) return;
+
+    const filePath = doc.storedPath || doc.stored_path;
 
     const bodyHtml = `
       <div class="detail-grid" style="grid-template-columns: 1fr 1fr; gap: var(--space-4);">
@@ -489,8 +479,15 @@ const DocumentsPage = {
         </div>
         <div style="grid-column: 1 / -1;">
           <span class="detail-label">File Attached</span>
-          <span class="detail-value" style="font-family: var(--font-mono); display: flex; align-items: center; gap: 6px;">
-            <span class="material-icons-round">description</span> ${Utils.escapeHtml(doc.fileName)}
+          <span class="detail-value" style="font-family: var(--font-mono); display: flex; align-items: center; justify-content: space-between;">
+            <span style="display: flex; align-items: center; gap: 6px;">
+              <span class="material-icons-round">description</span> ${Utils.escapeHtml(doc.fileName)}
+            </span>
+            ${filePath ? `
+              <a href="${API.getFileUrl(filePath)}" target="_blank" class="btn btn-ghost btn-xs">
+                <span class="material-icons-round">download</span> Download File
+              </a>
+            ` : ''}
           </span>
         </div>
       </div>

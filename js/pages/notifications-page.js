@@ -5,9 +5,17 @@
 const NotificationsPageView = {
   currentFilter: 'all',
 
-  render() {
+  async render() {
     const container = document.getElementById('page-container');
     const session = Auth.getSession();
+
+    container.innerHTML = Components.renderLoadingState('Loading notifications and alert center...');
+
+    try {
+      await Store.fetchNotifications();
+    } catch (err) {
+      console.error('Failed to load notifications:', err);
+    }
 
     const notifs = Store.getNotificationsForUser(session.userId, session.role, session.region, session.institutionId);
 
@@ -172,29 +180,36 @@ const NotificationsPageView = {
     `;
   },
 
-  setFilter(filter) {
+  async setFilter(filter) {
     this.currentFilter = filter;
-    this.render();
+    await this.render();
   },
 
-  markRead(id) {
-    Store.markNotificationRead(id);
-    Components.updateNotificationBadge();
-    this.render();
+  async markRead(id) {
+    try {
+      await Store.markNotificationRead(id);
+      await this.render();
+    } catch (err) {
+      Components.showToast(err.message || 'Failed to mark notification read', 'error');
+    }
   },
 
-  markAllRead() {
-    const session = Auth.getSession();
-    const notifs = Store.getNotificationsForUser(session.userId, session.role, session.region, session.institutionId);
-    notifs.forEach(n => Store.markNotificationRead(n.id));
-    Components.updateNotificationBadge();
-    Components.showToast('All notifications marked as read', 'success');
-    this.render();
+  async markAllRead() {
+    try {
+      await Store.markAllNotificationsRead();
+      Components.showToast('All notifications marked as read', 'success');
+      await this.render();
+    } catch (err) {
+      Components.showToast(err.message || 'Failed to mark notifications read', 'error');
+    }
   },
 
-  goToEntity(notifId, entityType, entityId) {
-    Store.markNotificationRead(notifId);
-    Components.updateNotificationBadge();
+  async goToEntity(notifId, entityType, entityId) {
+    try {
+      await Store.markNotificationRead(notifId);
+    } catch (e) {
+      // Ignore background read failure
+    }
     switch (entityType) {
       case 'application':
         Router.navigate('application-detail', { id: entityId });
@@ -209,36 +224,18 @@ const NotificationsPageView = {
         Router.navigate('evc');
         break;
       default:
-        this.render();
+        await this.render();
     }
   },
 
-  simulateEscalation() {
-    const session = Auth.getSession();
-    const newNotif = {
-      type: 'escalation',
-      title: 'CRITICAL ESCALATION: Compliance SLA Breached',
-      message: `System rule trigger: Multiple statutory deadlines exceeded. Escalated to ${session.fullName} (${Auth.ROLES[session.role]?.label || session.role}) for immediate intervention.`,
-      recipientId: session.userId,
-      recipientRole: session.role,
-      recipientRegion: session.region,
-      entityType: 'application',
-      entityId: 'app-007',
-      escalationLevel: 2,
-    };
-
-    Store.addNotification(newNotif);
-    Store.addAudit({
-      actor: 'system',
-      actorName: 'Escalation Engine',
-      action: 'escalation_triggered',
-      entityType: 'application',
-      entityId: 'app-007',
-      details: 'Automatic SLA escalation level 2 triggered for overdue scrutiny'
-    });
-
-    Components.updateNotificationBadge();
-    Components.showToast('Simulated escalation notification generated!', 'error', 'Escalation Alert');
-    this.render();
+  async simulateEscalation() {
+    try {
+      await API.simulateEscalation();
+      await Store.fetchNotifications();
+      Components.showToast('In-app escalation alert triggered and logged!', 'warning', 'Escalation Alert');
+      await this.render();
+    } catch (err) {
+      Components.showToast(err.message || 'Failed to trigger test escalation', 'error');
+    }
   }
 };

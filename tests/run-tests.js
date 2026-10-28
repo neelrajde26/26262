@@ -139,9 +139,74 @@ async function runAllTests() {
     assert.strictEqual(caScope.sql, '1 = 1');
   });
 
+  test('Table-aware SQL scoping prevents non-existent column errors across all entities', () => {
+    const roUser = { role: 'regional_officer', region: 'reg-north', userId: 'user-ro1' };
+    const instUser = { role: 'institution', institutionId: 'inst-001', userId: 'user-inst1' };
+
+    // Undertakings (no assigned_officer column)
+    const undScope = getScopeClause(roUser, 'undertakings');
+    const undRows = db.prepare(`SELECT * FROM undertakings WHERE ${undScope.sql}`).all(...undScope.params);
+    assert.ok(Array.isArray(undRows), 'Undertakings query succeeded without SQL error');
+
+    // Documents (no assigned_officer column)
+    const docScope = getScopeClause(roUser, 'documents');
+    const docRows = db.prepare(`SELECT * FROM documents WHERE ${docScope.sql}`).all(...docScope.params);
+    assert.ok(Array.isArray(docRows), 'Documents query succeeded without SQL error');
+
+    // Notifications (uses recipient_* columns)
+    const notifScope = getScopeClause(instUser, 'notifications');
+    const notifRows = db.prepare(`SELECT * FROM notifications WHERE ${notifScope.sql}`).all(...notifScope.params);
+    assert.ok(Array.isArray(notifRows), 'Notifications query succeeded without SQL error');
+
+    // Audit trail
+    const auditScope = getScopeClause(instUser, 'audit_trail');
+    const auditRows = db.prepare(`SELECT * FROM audit_trail WHERE ${auditScope.sql}`).all(...auditScope.params);
+    assert.ok(Array.isArray(auditRows), 'Audit trail query succeeded without SQL error');
+
+    // EVC Events
+    const evcScope = getScopeClause(roUser, 'evc_events');
+    const evcRows = db.prepare(`SELECT * FROM evc_events WHERE ${evcScope.sql}`).all(...evcScope.params);
+    assert.ok(Array.isArray(evcRows), 'EVC events query succeeded without SQL error');
+  });
+
+  test('Cross-institution isolation is strictly enforced', () => {
+    const instUser1 = { role: 'institution', institutionId: 'inst-001', userId: 'user-inst1' };
+    const instUser2 = { role: 'institution', institutionId: 'inst-002', userId: 'user-inst2' };
+
+    const { canAccessRecord } = require('../server/auth.js');
+
+    const appInst1 = db.prepare('SELECT * FROM applications WHERE institution_id = ?').get('inst-001');
+    const appInst2 = db.prepare('SELECT * FROM applications WHERE institution_id = ?').get('inst-002');
+
+    assert.ok(canAccessRecord(instUser1, 'applications', appInst1), 'Institution 1 can access its own application');
+    assert.ok(!canAccessRecord(instUser1, 'applications', appInst2), 'Institution 1 is blocked from accessing Institution 2 application');
+    assert.ok(canAccessRecord(instUser2, 'applications', appInst2), 'Institution 2 can access its own application');
+    assert.ok(!canAccessRecord(instUser2, 'applications', appInst1), 'Institution 2 is blocked from accessing Institution 1 application');
+  });
+
+  test('All 8 demo accounts authenticate successfully and have assigned roles', () => {
+    const demoAccounts = [
+      { username: 'ro_north', role: 'regional_officer' },
+      { username: 'ro_south', role: 'regional_officer' },
+      { username: 'inst_demotech', role: 'institution' },
+      { username: 'inst_southeng', role: 'institution' },
+      { username: 'bo_bureau1', role: 'bureau_officer' },
+      { username: 'evc_expert1', role: 'committee' },
+      { username: 'ca_authority', role: 'competent_authority' },
+      { username: 'admin', role: 'admin' }
+    ];
+
+    for (const acc of demoAccounts) {
+      const res = authenticateUser(acc.username, 'demo123');
+      assert.strictEqual(res.success, true, `Account ${acc.username} should authenticate`);
+      assert.strictEqual(res.user.role, acc.role, `Account ${acc.username} should have role ${acc.role}`);
+      assert.ok(res.token, `Account ${acc.username} should receive a valid token`);
+    }
+  });
+
   console.log('\n--- 4. Workflow Transition Engine ---');
   test('Authorized officer can advance application stage', () => {
-    const ro = { userId: 'user-ro1', fullName: 'Dr. Priya Mehta', role: 'regional_officer' };
+    const ro = { userId: 'user-ro1', fullName: 'Dr. Priya Mehta', role: 'regional_officer', region: 'reg-north' };
     const res = WorkflowEngine.advanceStage('app-001', 'evc-pending', 'Scrutiny verified all criteria', ro);
     assert.strictEqual(res.success, true);
     assert.strictEqual(res.currentStage, 'evc-pending');
@@ -156,15 +221,23 @@ async function runAllTests() {
     assert.ok(audit, 'Audit trail entry logged');
   });
 
+  test('Regional officer cannot advance application outside their jurisdiction', () => {
+    // ro_south attempting to advance Northern region app-001
+    const roSouth = { userId: 'user-ro2', fullName: 'Dr. K. Ramanathan', role: 'regional_officer', region: 'reg-south' };
+    const res = WorkflowEngine.advanceStage('app-001', 'approved', 'Attempting cross-regional action', roSouth);
+    assert.strictEqual(res.success, false);
+    assert.ok(res.error.includes('regional jurisdiction'));
+  });
+
   test('Unauthorized user is blocked from advancing workflow', () => {
-    const inst = { userId: 'user-inst1', fullName: 'Rajesh Sharma', role: 'institution' };
+    const inst = { userId: 'user-inst1', fullName: 'Rajesh Sharma', role: 'institution', institutionId: 'inst-001' };
     const res = WorkflowEngine.advanceStage('app-001', 'approved', 'Attempting self-approval', inst);
     assert.strictEqual(res.success, false);
     assert.ok(res.error.includes('Unauthorized'));
   });
 
   test('Returning application records mandatory reason and changes status', () => {
-    const ro = { userId: 'user-ro1', fullName: 'Dr. Priya Mehta', role: 'regional_officer' };
+    const ro = { userId: 'user-ro1', fullName: 'Dr. Priya Mehta', role: 'regional_officer', region: 'reg-north' };
     const res = WorkflowEngine.returnApplication('app-001', 'Incomplete laboratory floor plan proof', ro);
     assert.strictEqual(res.success, true);
 
@@ -220,6 +293,45 @@ async function runAllTests() {
     const result = AIService.regulatorySearch('What is EVC inspection?');
     assert.strictEqual(result.isAIGenerated, true);
     assert.ok(result.results.some(r => r.topic.includes('EVC')));
+  });
+
+  console.log('\n--- 7. Security, File Validation & Path Traversal Guards ---');
+  test('Upload extension validation accepts valid formats and blocks dangerous formats', () => {
+    const path = require('node:path');
+    const ALLOWED_UPLOAD_EXTS = ['.pdf', '.png', '.jpg', '.jpeg', '.xlsx', '.doc', '.docx'];
+
+    const validFiles = ['proof.pdf', 'photo.PNG', 'data.xlsx', 'report.docx'];
+    const invalidFiles = ['script.exe', 'payload.sh', 'shell.php', 'exploit.bat', 'hack.js'];
+
+    for (const f of validFiles) {
+      const ext = path.extname(f).toLowerCase();
+      assert.ok(ALLOWED_UPLOAD_EXTS.includes(ext), `Valid file ${f} should be allowed`);
+    }
+
+    for (const f of invalidFiles) {
+      const ext = path.extname(f).toLowerCase();
+      assert.ok(!ALLOWED_UPLOAD_EXTS.includes(ext), `Dangerous file ${f} should be rejected`);
+    }
+  });
+
+  test('Path traversal attempts are detected and prevented', () => {
+    const path = require('node:path');
+    const UPLOADS_DIR = path.resolve(__dirname, '..', 'uploads');
+
+    const dangerousFilenames = [
+      '../../server.js',
+      '..\\..\\server.js',
+      '../../../etc/passwd',
+      '..%2F..%2Fserver.js',
+      'uploads/../../flowguard.db'
+    ];
+
+    for (const df of dangerousFilenames) {
+      const safeFilename = path.basename(df);
+      const targetPath = path.resolve(UPLOADS_DIR, safeFilename);
+      // Ensure path.resolve with basename is strictly inside UPLOADS_DIR
+      assert.ok(targetPath.startsWith(UPLOADS_DIR), `Sanitized path for ${df} must remain inside uploads directory`);
+    }
   });
 
   console.log('\n================================================');

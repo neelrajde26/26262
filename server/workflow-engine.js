@@ -13,6 +13,17 @@ function dateOffset(days) {
 }
 
 const WorkflowEngine = {
+  // Check if a user has jurisdiction over a specific application
+  checkJurisdiction(user, app) {
+    if (!user || !app) return false;
+    if (['competent_authority', 'admin'].includes(user.role)) return true;
+    if (user.role === 'regional_officer') return user.region === app.region;
+    if (user.role === 'bureau_officer') {
+      return user.region === app.region || user.userId === app.assigned_officer;
+    }
+    return false;
+  },
+
   // Advance an application to the next configured workflow stage
   advanceStage(applicationId, nextStageId, notes, user) {
     if (!hasPermission(user.role, 'advance_stage') && !hasPermission(user.role, 'approve_application')) {
@@ -21,6 +32,10 @@ const WorkflowEngine = {
 
     const app = db.prepare('SELECT * FROM applications WHERE id = ?').get(applicationId);
     if (!app) return { success: false, error: 'Application not found' };
+
+    if (!this.checkJurisdiction(user, app)) {
+      return { success: false, error: 'Access Denied: You do not have regional jurisdiction over this application.' };
+    }
 
     if (['approved', 'rejected', 'cancelled'].includes(app.status)) {
       return { success: false, error: `Cannot advance application in '${app.status}' terminal state.` };
@@ -47,7 +62,7 @@ const WorkflowEngine = {
     const nextDueDate = nextStageId === 'approved' ? null : dateOffset(timelineDays);
     const now = new Date().toISOString();
 
-    // Begin transaction updates
+    // Begin updates
     const prevStatus = app.status;
     const prevStage = app.current_stage;
 
@@ -123,7 +138,7 @@ const WorkflowEngine = {
       }
     }
 
-    // Notify institution
+    // In-app Notification to institution
     const notifId = 'ntf-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
     db.prepare(`
       INSERT INTO notifications VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -140,7 +155,7 @@ const WorkflowEngine = {
       applicationId,
       0,
       0,
-      'delivered',
+      'in_app',
       now
     );
 
@@ -165,6 +180,10 @@ const WorkflowEngine = {
 
     const app = db.prepare('SELECT * FROM applications WHERE id = ?').get(applicationId);
     if (!app) return { success: false, error: 'Application not found' };
+
+    if (!this.checkJurisdiction(user, app)) {
+      return { success: false, error: 'Access Denied: You do not have regional jurisdiction over this application.' };
+    }
 
     const now = new Date().toISOString();
     const returnDueDate = dateOffset(7); // 7-day correction SLA
@@ -211,7 +230,7 @@ const WorkflowEngine = {
       now
     );
 
-    // High-priority notification to institution
+    // High-priority in-app notification to institution
     const notifId = 'ntf-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
     db.prepare(`
       INSERT INTO notifications VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -228,7 +247,7 @@ const WorkflowEngine = {
       applicationId,
       0,
       0,
-      'delivered',
+      'in_app',
       now
     );
 
@@ -294,7 +313,7 @@ const WorkflowEngine = {
       now
     );
 
-    // Notify institution & regional officer
+    // In-app Notify institution & regional officer
     const notifId = 'ntf-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
     db.prepare(`
       INSERT INTO notifications VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -311,7 +330,7 @@ const WorkflowEngine = {
       applicationId,
       0,
       0,
-      'delivered',
+      'in_app',
       now
     );
 
@@ -381,7 +400,7 @@ const WorkflowEngine = {
       now
     );
 
-    // Notify institution
+    // In-app Notify institution
     const notifId = 'ntf-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
     db.prepare(`
       INSERT INTO notifications VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -398,7 +417,7 @@ const WorkflowEngine = {
       applicationId,
       0,
       0,
-      'delivered',
+      'in_app',
       now
     );
 

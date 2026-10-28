@@ -8,11 +8,11 @@ services:
     container_name: aicte-flowguard
     restart: unless-stopped
     ports:
-      - "5500:5500"
+      - "${PORT:-5500}:5500"
     environment:
       - PORT=5500
       - NODE_ENV=production
-      - JWT_SECRET=flowguard-sih2026-production-hmac-key-replace-in-cloud
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET environment variable is required in production}
     volumes:
       - flowguard-data:/app/data
       - flowguard-uploads:/app/uploads

@@ -1,11 +1,13 @@
 /* ============================================
    AICTE FlowGuard — Full-Stack Server & REST API
+   Native Node.js (No external dependencies)
    ============================================ */
 
 const http = require('node:http');
 const path = require('node:path');
 const fs = require('node:fs');
 const url = require('node:url');
+const crypto = require('node:crypto');
 
 const { db, seedDatabase, hashPassword } = require('./server/db.js');
 const {
@@ -13,21 +15,23 @@ const {
   authenticateUser,
   getSessionFromRequest,
   hasPermission,
-  getScopeClause
+  getScopeClause,
+  canAccessRecord
 } = require('./server/auth.js');
 const WorkflowEngine = require('./server/workflow-engine.js');
 const Scheduler = require('./server/scheduler.js');
 const AIService = require('./server/ai-service.js');
 
 const PORT = process.env.PORT || 5500;
-const PUBLIC_DIR = path.join(__dirname);
-const UPLOADS_DIR = path.join(__dirname, 'uploads');
+const PUBLIC_DIR = path.resolve(__dirname);
+const UPLOADS_DIR = path.resolve(__dirname, 'uploads');
+const DATA_DIR = path.resolve(__dirname, 'data');
 
 if (!fs.existsSync(UPLOADS_DIR)) {
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
 
-// MIME types for static assets
+// MIME types for static assets and downloads
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -35,11 +39,17 @@ const MIME_TYPES = {
   '.json': 'application/json; charset=utf-8',
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
   '.pdf': 'application/pdf',
-  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.doc': 'application/msword',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 };
+
+const ALLOWED_UPLOAD_EXTS = ['.pdf', '.png', '.jpg', '.jpeg', '.xlsx', '.doc', '.docx'];
+const MAX_BODY_SIZE = 15 * 1024 * 1024; // 15MB limit
 
 // JSON response helper
 function sendJSON(res, statusCode, data, headers = {}) {
@@ -55,29 +65,203 @@ function sendJSON(res, statusCode, data, headers = {}) {
   res.end(JSON.stringify(data));
 }
 
-// Parse request body
+// RFC 7807 Problem Details Response Helper
+function sendProblem(res, status, title, detail, instance = '', extra = {}) {
+  const typeMap = {
+    400: 'bad-request',
+    401: 'unauthorized',
+    403: 'forbidden',
+    404: 'not-found',
+    409: 'conflict',
+    413: 'payload-too-large',
+    415: 'unsupported-media-type',
+    422: 'unprocessable-entity',
+    500: 'internal-server-error'
+  };
+
+  const problem = {
+    type: `https://flowguard.aicte.gov.in/errors/${typeMap[status] || 'error'}`,
+    title,
+    status,
+    detail,
+    instance: instance || undefined,
+    error: detail, // Backward compatibility for legacy clients
+    timestamp: new Date().toISOString(),
+    ...extra
+  };
+
+  sendJSON(res, status, problem);
+}
+
+// Parse request body with size limits and strict JSON verification
 function parseBody(req) {
-  return new Promise((resolve) => {
-    let body = '';
+  return new Promise((resolve, reject) => {
+    let rawBody = '';
+    let totalLength = 0;
+    let destroyed = false;
+
     req.on('data', chunk => {
-      body += chunk.toString();
-      if (body.length > 10 * 1024 * 1024) { // 10MB limit
+      if (destroyed) return;
+      totalLength += chunk.length;
+      if (totalLength > MAX_BODY_SIZE) {
+        destroyed = true;
+        const err = new Error('Payload Too Large: Body exceeds 15MB limit');
+        err.statusCode = 413;
         req.destroy();
+        reject(err);
+        return;
+      }
+      rawBody += chunk.toString('utf8');
+    });
+
+    req.on('end', () => {
+      if (destroyed) return;
+      if (!rawBody || rawBody.trim() === '') {
+        return resolve({});
+      }
+      try {
+        const parsed = JSON.parse(rawBody);
+        resolve(parsed);
+      } catch (err) {
+        const parseErr = new Error(`Malformed JSON request payload: ${err.message}`);
+        parseErr.statusCode = 400;
+        reject(parseErr);
       }
     });
-    req.on('end', () => {
-      try {
-        resolve(body ? JSON.parse(body) : {});
-      } catch (err) {
-        resolve({ raw: body });
-      }
+
+    req.on('error', err => {
+      if (!destroyed) reject(err);
     });
   });
 }
 
+// Safe multipart / raw upload extractor
+function parseMultipartBuffer(buffer, boundary) {
+  const boundaryBuffer = Buffer.from(`--${boundary}`);
+  const parts = [];
+  let startIndex = 0;
+
+  while ((startIndex = buffer.indexOf(boundaryBuffer, startIndex)) !== -1) {
+    startIndex += boundaryBuffer.length;
+    if (buffer[startIndex] === 45 && buffer[startIndex + 1] === 45) { // '--' end
+      break;
+    }
+    if (buffer[startIndex] === 13 && buffer[startIndex + 1] === 10) { // '\r\n'
+      startIndex += 2;
+    }
+
+    const nextIndex = buffer.indexOf(boundaryBuffer, startIndex);
+    if (nextIndex === -1) break;
+
+    const partBuffer = buffer.slice(startIndex, nextIndex - 2); // strip trailing \r\n
+    const headerEndIndex = partBuffer.indexOf(Buffer.from('\r\n\r\n'));
+    if (headerEndIndex !== -1) {
+      const headerStr = partBuffer.slice(0, headerEndIndex).toString('utf8');
+      const bodyBuffer = partBuffer.slice(headerEndIndex + 4);
+
+      const nameMatch = headerStr.match(/name="([^"]+)"/);
+      const filenameMatch = headerStr.match(/filename="([^"]+)"/);
+      const contentTypeMatch = headerStr.match(/Content-Type:\s*([^\r\n]+)/i);
+
+      parts.push({
+        name: nameMatch ? nameMatch[1] : null,
+        filename: filenameMatch ? filenameMatch[1] : null,
+        contentType: contentTypeMatch ? contentTypeMatch[1] : 'application/octet-stream',
+        data: bodyBuffer
+      });
+    }
+    startIndex = nextIndex;
+  }
+  return parts;
+}
+
+// Receive raw binary buffer
+function parseRawBodyBuffer(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let totalLength = 0;
+    let destroyed = false;
+
+    req.on('data', chunk => {
+      if (destroyed) return;
+      totalLength += chunk.length;
+      if (totalLength > MAX_BODY_SIZE) {
+        destroyed = true;
+        const err = new Error('Payload Too Large: File exceeds 15MB limit');
+        err.statusCode = 413;
+        req.destroy();
+        reject(err);
+        return;
+      }
+      chunks.push(chunk);
+    });
+
+    req.on('end', () => {
+      if (destroyed) return;
+      resolve(Buffer.concat(chunks));
+    });
+
+    req.on('error', err => {
+      if (!destroyed) reject(err);
+    });
+  });
+}
+
+// In-memory upload provenance cache for newly uploaded files pending attachment
+const uploadedFilesRegistry = new Map();
+
+// Verify if user is authorized to download a stored upload file
+function canAccessUpload(session, storedFileName) {
+  if (!session || !storedFileName) return false;
+  if (['admin', 'competent_authority', 'bureau_officer'].includes(session.role)) return true;
+
+  // Check newly uploaded registry
+  const regEntry = uploadedFilesRegistry.get(storedFileName);
+  if (regEntry) {
+    if (session.userId === regEntry.userId) return true;
+    if (session.role === 'institution' && session.institutionId === regEntry.institutionId) return true;
+    if (session.role === 'regional_officer' && session.region === regEntry.region) return true;
+    if (session.role === 'committee') return true;
+  }
+
+  // Check documents
+  const doc = db.prepare('SELECT institution_id, region FROM documents WHERE stored_path = ?').get(storedFileName);
+  if (doc) {
+    if (session.role === 'institution') return doc.institution_id === session.institutionId;
+    if (session.role === 'regional_officer') return doc.region === session.region;
+    return true;
+  }
+
+  // Check undertaking submissions
+  const sub = db.prepare(`
+    SELECT u.institution_id, u.region
+    FROM undertaking_submissions s
+    JOIN undertakings u ON s.undertaking_id = u.id
+    WHERE s.stored_path = ?
+  `).get(storedFileName);
+  if (sub) {
+    if (session.role === 'institution') return sub.institution_id === session.institutionId;
+    if (session.role === 'regional_officer') return sub.region === session.region;
+    return true;
+  }
+
+  // Check applications attachments
+  const app = db.prepare(`
+    SELECT institution_id, region, attachments FROM applications WHERE attachments LIKE ?
+  `).get(`%${storedFileName}%`);
+  if (app) {
+    if (session.role === 'institution') return app.institution_id === session.institutionId;
+    if (session.role === 'regional_officer') return app.region === session.region;
+    return true;
+  }
+
+  return false;
+}
+
 // HTTP Server
 const server = http.createServer(async (req, res) => {
-  const parsedUrl = url.parse(req.url, true);
+  const parsedUrl = new URL(req.url, 'http://' + (req.headers.host || 'localhost:5500'));
+  parsedUrl.query = Object.fromEntries(parsedUrl.searchParams.entries());
   const pathname = parsedUrl.pathname;
   const method = req.method.toUpperCase();
 
@@ -93,712 +277,1035 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // -------------------------------------------------------------
-  // API ROUTING
-  // -------------------------------------------------------------
+  // =============================================================
+  // REST API ROUTING
+  // =============================================================
   if (pathname.startsWith('/api/')) {
-    const session = getSessionFromRequest(req);
+    try {
+      const session = getSessionFromRequest(req);
 
-    // 1. Health Check
-    if (pathname === '/api/health' && method === 'GET') {
-      return sendJSON(res, 200, {
-        status: 'healthy',
-        platform: 'AICTE FlowGuard',
-        version: '2.0.0',
-        environment: 'SIH-2026',
-        database: 'node:sqlite (WAL Mode)',
-        scheduler: 'active',
-        timestamp: new Date().toISOString()
-      });
-    }
+      // 1. Health Check
+      if (pathname === '/api/health' && method === 'GET') {
+        let dbOk = false;
+        try {
+          db.prepare('SELECT 1').get();
+          dbOk = true;
+        } catch(e) {}
 
-    // 2. Authentication: Login
-    if (pathname === '/api/auth/login' && method === 'POST') {
-      const body = await parseBody(req);
-      if (!body.username || !body.password) {
-        return sendJSON(res, 400, { error: 'Username and password required' });
+        return sendJSON(res, 200, {
+          status: dbOk ? 'healthy' : 'degraded',
+          platform: 'AICTE FlowGuard',
+          version: '2.0.0',
+          environment: process.env.NODE_ENV || 'development',
+          database: dbOk ? 'node:sqlite (WAL Mode, Online)' : 'error',
+          scheduler: 'active',
+          timestamp: new Date().toISOString()
+        });
       }
-      const result = authenticateUser(body.username, body.password);
-      if (!result.success) {
-        return sendJSON(res, 401, { error: result.error });
-      }
-      const cookie = `flowguard_token=${result.token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400`;
-      return sendJSON(res, 200, { success: true, user: result.user, token: result.token }, { 'Set-Cookie': cookie });
-    }
 
-    // 3. Authentication: Logout
-    if (pathname === '/api/auth/logout' && method === 'POST') {
-      if (session) {
+      // 2. Authentication: Login
+      if (pathname === '/api/auth/login' && method === 'POST') {
+        const body = await parseBody(req);
+        if (!body.username || !body.password) {
+          return sendProblem(res, 400, 'Bad Request', 'Username and password are required', pathname);
+        }
+        const result = authenticateUser(body.username.trim(), body.password);
+        if (!result.success) {
+          return sendProblem(res, 401, 'Unauthorized', result.error, pathname);
+        }
+
+        const isHttps = req.headers['x-forwarded-proto'] === 'https';
+        const secureFlag = isHttps ? '; Secure' : '';
+        const cookie = `flowguard_token=${result.token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400${secureFlag}`;
+
+        return sendJSON(res, 200, {
+          success: true,
+          user: result.user,
+          token: result.token
+        }, { 'Set-Cookie': cookie });
+      }
+
+      // 3. Authentication: Logout
+      if (pathname === '/api/auth/logout' && method === 'POST') {
+        if (session) {
+          db.prepare('INSERT INTO audit_trail VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
+            'aud-' + Date.now().toString(36),
+            session.userId,
+            session.fullName,
+            'user_logout',
+            'user',
+            session.userId,
+            `${session.fullName} signed out`,
+            null,
+            null,
+            req.socket.remoteAddress || '127.0.0.1',
+            new Date().toISOString()
+          );
+        }
+        return sendJSON(res, 200, { success: true }, { 'Set-Cookie': 'flowguard_token=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict' });
+      }
+
+      // 4. Authentication: Me
+      if (pathname === '/api/auth/me' && method === 'GET') {
+        if (!session) return sendProblem(res, 401, 'Unauthorized', 'Valid session token required', pathname);
+        return sendJSON(res, 200, { user: session, roles: ROLES });
+      }
+
+      // -------------------------------------------------------------
+      // PROTECTED API ENDPOINTS
+      // -------------------------------------------------------------
+      if (!session) {
+        return sendProblem(res, 401, 'Unauthorized', 'Valid authentication token required for this endpoint', pathname);
+      }
+
+      // 5. File Upload: Multipart or Base64 JSON
+      if (pathname === '/api/upload' && method === 'POST') {
+        const contentType = req.headers['content-type'] || '';
+        let originalName = 'document.pdf';
+        let fileBuffer = null;
+
+        if (contentType.includes('multipart/form-data')) {
+          const boundaryMatch = contentType.match(/boundary=([^;]+)/);
+          if (!boundaryMatch) {
+            return sendProblem(res, 400, 'Bad Request', 'Missing multipart boundary header', pathname);
+          }
+          const rawBuffer = await parseRawBodyBuffer(req);
+          const parts = parseMultipartBuffer(rawBuffer, boundaryMatch[1]);
+          const filePart = parts.find(p => p.filename && p.data);
+          if (!filePart) {
+            return sendProblem(res, 400, 'Bad Request', 'No file found in multipart upload payload', pathname);
+          }
+          originalName = filePart.filename;
+          fileBuffer = filePart.data;
+        } else {
+          // JSON base64 upload
+          const body = await parseBody(req);
+          if (!body.fileData || !body.fileName) {
+            return sendProblem(res, 400, 'Bad Request', 'Both fileName and fileData (base64) are required', pathname);
+          }
+          originalName = path.basename(body.fileName);
+          const cleanBase64 = body.fileData.replace(/^data:[^;]+;base64,/, '');
+          fileBuffer = Buffer.from(cleanBase64, 'base64');
+        }
+
+        // Validate File Extension
+        const ext = path.extname(originalName).toLowerCase();
+        if (!ALLOWED_UPLOAD_EXTS.includes(ext)) {
+          return sendProblem(res, 415, 'Unsupported Media Type', `Unsupported file extension '${ext}'. Allowed: ${ALLOWED_UPLOAD_EXTS.join(', ')}`, pathname);
+        }
+
+        // Validate File Size
+        if (fileBuffer.length > 10 * 1024 * 1024) {
+          return sendProblem(res, 413, 'Payload Too Large', 'File exceeds the maximum allowable size of 10MB', pathname);
+        }
+
+        // Generate Collision-Resistant Safe Filename
+        const safeStoredName = `fg_${Date.now().toString(36)}_${crypto.randomBytes(8).toString('hex')}${ext}`;
+        const targetPath = path.join(UPLOADS_DIR, safeStoredName);
+
+        // Security check: ensure path does not escape UPLOADS_DIR
+        if (!targetPath.startsWith(UPLOADS_DIR)) {
+          return sendProblem(res, 400, 'Bad Request', 'Invalid target file destination path', pathname);
+        }
+
+        fs.writeFileSync(targetPath, fileBuffer);
+        uploadedFilesRegistry.set(safeStoredName, {
+          userId: session.userId,
+          institutionId: session.institutionId,
+          region: session.region,
+          createdAt: Date.now()
+        });
+
+        return sendJSON(res, 201, {
+          success: true,
+          storedPath: safeStoredName,
+          fileName: originalName,
+          fileSize: fileBuffer.length,
+          mimeType: MIME_TYPES[ext] || 'application/octet-stream',
+          url: `/api/files/${safeStoredName}`
+        });
+      }
+
+      // 6. Secure File Retrieval: Record-Scoped Access
+      if (pathname.match(/^\/api\/files\/[^/]+$/) && method === 'GET') {
+        const storedName = path.basename(pathname.split('/')[3]);
+        const targetPath = path.normalize(path.join(UPLOADS_DIR, storedName));
+
+        // Path Traversal Security Verification
+        if (!targetPath.startsWith(UPLOADS_DIR)) {
+          return sendProblem(res, 403, 'Forbidden', 'Access Denied: Path traversal detected', pathname);
+        }
+
+        if (!fs.existsSync(targetPath)) {
+          return sendProblem(res, 404, 'Not Found', 'The requested file does not exist', pathname);
+        }
+
+        // Enforce Record-Level Ownership / Scope Authorization
+        const authorized = canAccessUpload(session, storedName);
+        if (!authorized) {
+          return sendProblem(res, 403, 'Forbidden', 'Access Denied: You do not have permission to download this file', pathname);
+        }
+
+        const ext = path.extname(targetPath).toLowerCase();
+        const stat = fs.statSync(targetPath);
+
+        res.writeHead(200, {
+          'Content-Type': MIME_TYPES[ext] || 'application/octet-stream',
+          'Content-Length': stat.size,
+          'Content-Disposition': `inline; filename="${storedName}"`,
+          'X-Content-Type-Options': 'nosniff',
+          'X-Frame-Options': 'SAMEORIGIN'
+        });
+
+        fs.createReadStream(targetPath).pipe(res);
+        return;
+      }
+
+      // 7. Applications: List
+      if (pathname === '/api/applications' && method === 'GET') {
+        const scope = getScopeClause(session, 'applications');
+        let query = `SELECT * FROM applications WHERE ${scope.sql}`;
+        const params = [...scope.params];
+
+        if (parsedUrl.query.status) {
+          query += ' AND status = ?';
+          params.push(parsedUrl.query.status);
+        }
+        if (parsedUrl.query.region) {
+          // Regional officer cannot override own region query
+          if (session.role !== 'regional_officer') {
+            query += ' AND region = ?';
+            params.push(parsedUrl.query.region);
+          }
+        }
+        if (parsedUrl.query.type) {
+          query += ' AND type = ?';
+          params.push(parsedUrl.query.type);
+        }
+        if (parsedUrl.query.search) {
+          query += ' AND (application_number LIKE ? OR institution_name LIKE ? OR program_name LIKE ?)';
+          const s = `%${parsedUrl.query.search}%`;
+          params.push(s, s, s);
+        }
+
+        query += ' ORDER BY submitted_date DESC';
+        const apps = db.prepare(query).all(...params);
+
+        apps.forEach(a => {
+          if (typeof a.attachments === 'string') {
+            try { a.attachments = JSON.parse(a.attachments); } catch(e) { a.attachments = []; }
+          }
+        });
+
+        return sendJSON(res, 200, { applications: apps });
+      }
+
+      // 8. Applications: Detail
+      if (pathname.match(/^\/api\/applications\/[^/]+$/) && method === 'GET') {
+        const id = pathname.split('/')[3];
+        const scope = getScopeClause(session, 'applications');
+        const app = db.prepare(`SELECT * FROM applications WHERE id = ? AND (${scope.sql})`).get(id, ...scope.params);
+        if (!app) {
+          return sendProblem(res, 404, 'Not Found', 'Application not found or access restricted', pathname);
+        }
+
+        if (typeof app.attachments === 'string') {
+          try { app.attachments = JSON.parse(app.attachments); } catch(e) { app.attachments = []; }
+        }
+
+        const history = db.prepare('SELECT * FROM stage_history WHERE application_id = ? ORDER BY date DESC').all(id);
+        const audits = db.prepare('SELECT * FROM audit_trail WHERE entity_id = ? ORDER BY timestamp DESC').all(id);
+        const evc = db.prepare('SELECT * FROM evc_events WHERE application_id = ?').get(id);
+        const undertakings = db.prepare('SELECT * FROM undertakings WHERE application_id = ?').all(id);
+        const template = db.prepare('SELECT * FROM workflow_templates WHERE id = ?').get(app.workflow_template_id);
+
+        return sendJSON(res, 200, {
+          application: app,
+          stageHistory: history,
+          audits,
+          evc,
+          undertakings,
+          template: template ? { ...template, stages: JSON.parse(template.stages) } : null
+        });
+      }
+
+      // 9. Applications: Create
+      if (pathname === '/api/applications' && method === 'POST') {
+        if (!hasPermission(session.role, 'submit_application')) {
+          return sendProblem(res, 403, 'Forbidden', 'Role not authorized to submit applications', pathname);
+        }
+
+        const body = await parseBody(req);
+        if (!body.programName || typeof body.programName !== 'string' || body.programName.trim().length < 3) {
+          return sendProblem(res, 400, 'Bad Request', 'Valid programName (at least 3 characters) is required', pathname);
+        }
+        if (!body.workflowTemplateId) {
+          return sendProblem(res, 400, 'Bad Request', 'workflowTemplateId is required', pathname);
+        }
+
+        // Strictly enforce that institution user can ONLY create for their assigned institution
+        let instId = session.institutionId;
+        if (session.role !== 'institution' && body.institutionId) {
+          instId = body.institutionId;
+        }
+        if (!instId) {
+          return sendProblem(res, 400, 'Bad Request', 'Valid institution identification required', pathname);
+        }
+
+        const inst = db.prepare('SELECT * FROM institutions WHERE id = ?').get(instId);
+        if (!inst) {
+          return sendProblem(res, 400, 'Bad Request', 'Institution does not exist', pathname);
+        }
+
+        const template = db.prepare('SELECT * FROM workflow_templates WHERE id = ?').get(body.workflowTemplateId);
+        if (!template) {
+          return sendProblem(res, 400, 'Bad Request', 'Invalid workflow template specified', pathname);
+        }
+
+        const stages = JSON.parse(template.stages);
+        const firstStage = stages[0]?.id || 'scrutiny';
+        const firstSlaDays = stages[0]?.timelineDays || 15;
+
+        const year = new Date().getFullYear();
+        const count = db.prepare('SELECT COUNT(*) as c FROM applications').get().c + 1;
+        const seq = String(count).padStart(4, '0');
+        const regRow = db.prepare('SELECT code FROM regions WHERE id = ?').get(inst.region);
+        const regCode = regRow?.code || 'NR';
+        const appNumber = `FG/${regCode}/${year}/${seq}`;
+        const appId = 'app-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
+        const now = new Date().toISOString();
+        const dueDate = new Date();
+        dueDate.setDate(dueDate.getDate() + firstSlaDays);
+
+        db.prepare(`
+          INSERT INTO applications VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          appId,
+          appNumber,
+          inst.id,
+          inst.name,
+          body.type || 'new-program',
+          body.programName.trim(),
+          template.id,
+          firstStage,
+          firstStage,
+          inst.region,
+          null,
+          null,
+          now.split('T')[0],
+          dueDate.toISOString().split('T')[0],
+          body.notes || '',
+          null,
+          JSON.stringify(body.attachments || ['application_form.pdf']),
+          body.priority || (body.type === 'new-institution' ? 'high' : 'normal'),
+          body.type === 'new-institution' ? 1 : 0,
+          now,
+          now
+        );
+
+        // Stage history
+        db.prepare('INSERT INTO stage_history VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+          'hist-' + Date.now().toString(36),
+          appId,
+          'submitted',
+          'Application Submitted',
+          session.userId,
+          session.fullName,
+          now,
+          body.notes || 'Initial application filed'
+        );
+
+        // Audit
         db.prepare('INSERT INTO audit_trail VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
           'aud-' + Date.now().toString(36),
           session.userId,
           session.fullName,
-          'user_logout',
-          'user',
-          session.userId,
-          `${session.fullName} signed out`,
+          'application_submitted',
+          'application',
+          appId,
+          `Submitted application ${appNumber} (${body.programName.trim()})`,
           null,
-          null,
-          '127.0.0.1',
-          new Date().toISOString()
+          JSON.stringify({ status: firstStage, programName: body.programName.trim() }),
+          req.socket.remoteAddress || '127.0.0.1',
+          now
         );
-      }
-      return sendJSON(res, 200, { success: true }, { 'Set-Cookie': 'flowguard_token=; Path=/; Max-Age=0' });
-    }
 
-    // 4. Authentication: Me
-    if (pathname === '/api/auth/me' && method === 'GET') {
-      if (!session) return sendJSON(res, 401, { error: 'Not authenticated' });
-      return sendJSON(res, 200, { user: session, roles: ROLES });
-    }
-
-    // --- PROTECTED ROUTES BELOW ---
-    if (!session) {
-      return sendJSON(res, 401, { error: 'Unauthorized: Valid session token required' });
-    }
-
-    // 5. Applications: List
-    if (pathname === '/api/applications' && method === 'GET') {
-      const scope = getScopeClause(session);
-      let query = `SELECT * FROM applications WHERE ${scope.sql}`;
-      const params = [...scope.params];
-
-      if (parsedUrl.query.status) {
-        query += ' AND status = ?';
-        params.push(parsedUrl.query.status);
-      }
-      if (parsedUrl.query.region) {
-        query += ' AND region = ?';
-        params.push(parsedUrl.query.region);
-      }
-      if (parsedUrl.query.type) {
-        query += ' AND type = ?';
-        params.push(parsedUrl.query.type);
-      }
-      if (parsedUrl.query.search) {
-        query += ' AND (application_number LIKE ? OR institution_name LIKE ? OR program_name LIKE ?)';
-        const s = `%${parsedUrl.query.search}%`;
-        params.push(s, s, s);
+        return sendJSON(res, 201, { success: true, applicationId: appId, applicationNumber: appNumber });
       }
 
-      query += ' ORDER BY submitted_date DESC';
-      const apps = db.prepare(query).all(...params);
-
-      // Parse JSON strings
-      apps.forEach(a => {
-        if (typeof a.attachments === 'string') {
-          try { a.attachments = JSON.parse(a.attachments); } catch(e) { a.attachments = []; }
+      // 10. Applications: Advance Stage
+      if (pathname.match(/^\/api\/applications\/[^/]+\/advance$/) && method === 'POST') {
+        const id = pathname.split('/')[3];
+        const body = await parseBody(req);
+        if (!body.nextStage) {
+          return sendProblem(res, 400, 'Bad Request', 'nextStage parameter is required', pathname);
         }
-      });
-
-      return sendJSON(res, 200, { applications: apps });
-    }
-
-    // 6. Applications: Detail
-    if (pathname.match(/^\/api\/applications\/[^/]+$/) && method === 'GET') {
-      const id = pathname.split('/')[3];
-      const scope = getScopeClause(session);
-      const app = db.prepare(`SELECT * FROM applications WHERE id = ? AND (${scope.sql})`).get(id, ...scope.params);
-      if (!app) return sendJSON(res, 404, { error: 'Application not found or access restricted' });
-
-      if (typeof app.attachments === 'string') {
-        try { app.attachments = JSON.parse(app.attachments); } catch(e) { app.attachments = []; }
+        const result = WorkflowEngine.advanceStage(id, body.nextStage, body.notes, session);
+        if (!result.success) {
+          const status = result.error.includes('Unauthorized') || result.error.includes('Access Denied') ? 403 : 400;
+          return sendProblem(res, status, 'Workflow Advance Error', result.error, pathname);
+        }
+        return sendJSON(res, 200, result);
       }
 
-      const history = db.prepare('SELECT * FROM stage_history WHERE application_id = ? ORDER BY date DESC').all(id);
-      const audits = db.prepare('SELECT * FROM audit_trail WHERE entity_id = ? ORDER BY timestamp DESC').all(id);
-      const evc = db.prepare('SELECT * FROM evc_events WHERE application_id = ?').get(id);
-      const undertakings = db.prepare('SELECT * FROM undertakings WHERE application_id = ?').all(id);
-      const template = db.prepare('SELECT * FROM workflow_templates WHERE id = ?').get(app.workflow_template_id);
-
-      return sendJSON(res, 200, {
-        application: app,
-        stageHistory: history,
-        audits,
-        evc,
-        undertakings,
-        template: template ? { ...template, stages: JSON.parse(template.stages) } : null
-      });
-    }
-
-    // 7. Applications: Create
-    if (pathname === '/api/applications' && method === 'POST') {
-      if (!hasPermission(session.role, 'submit_application')) {
-        return sendJSON(res, 403, { error: 'Forbidden: Role not authorized to submit applications' });
-      }
-      const body = await parseBody(req);
-      if (!body.programName || !body.workflowTemplateId) {
-        return sendJSON(res, 400, { error: 'Program name and workflow template required' });
+      // 11. Applications: Return
+      if (pathname.match(/^\/api\/applications\/[^/]+\/return$/) && method === 'POST') {
+        const id = pathname.split('/')[3];
+        const body = await parseBody(req);
+        if (!body.returnReason || !body.returnReason.trim()) {
+          return sendProblem(res, 400, 'Bad Request', 'A mandatory returnReason must be specified', pathname);
+        }
+        const result = WorkflowEngine.returnApplication(id, body.returnReason, session);
+        if (!result.success) {
+          const status = result.error.includes('Unauthorized') || result.error.includes('Access Denied') ? 403 : 400;
+          return sendProblem(res, status, 'Workflow Return Error', result.error, pathname);
+        }
+        return sendJSON(res, 200, result);
       }
 
-      const instId = session.institutionId || body.institutionId;
-      const inst = db.prepare('SELECT * FROM institutions WHERE id = ?').get(instId);
-      if (!inst) return sendJSON(res, 400, { error: 'Invalid institution' });
-
-      const template = db.prepare('SELECT * FROM workflow_templates WHERE id = ?').get(body.workflowTemplateId);
-      if (!template) return sendJSON(res, 400, { error: 'Invalid workflow template' });
-
-      const stages = JSON.parse(template.stages);
-      const firstStage = stages[0]?.id || 'scrutiny';
-      const firstSlaDays = stages[0]?.timelineDays || 15;
-
-      const year = new Date().getFullYear();
-      const count = db.prepare('SELECT COUNT(*) as c FROM applications').get().c + 1;
-      const seq = String(count).padStart(4, '0');
-      const regRow = db.prepare('SELECT code FROM regions WHERE id = ?').get(inst.region);
-      const regCode = regRow?.code || 'NR';
-      const appNumber = `FG/${regCode}/${year}/${seq}`;
-      const appId = 'app-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
-      const now = new Date().toISOString();
-      const dueDate = new Date();
-      dueDate.setDate(dueDate.getDate() + firstSlaDays);
-
-      db.prepare(`
-        INSERT INTO applications VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        appId,
-        appNumber,
-        inst.id,
-        inst.name,
-        body.type || 'new-program',
-        body.programName,
-        template.id,
-        firstStage,
-        firstStage,
-        inst.region,
-        null,
-        null,
-        now.split('T')[0],
-        dueDate.toISOString().split('T')[0],
-        body.notes || '',
-        null,
-        JSON.stringify(body.attachments || ['application_form.pdf']),
-        body.priority || (body.type === 'new-institution' ? 'high' : 'normal'),
-        body.type === 'new-institution' ? 1 : 0,
-        now,
-        now
-      );
-
-      // Record stage history
-      db.prepare('INSERT INTO stage_history VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
-        'hist-' + Date.now().toString(36),
-        appId,
-        'submitted',
-        'Application Submitted',
-        session.userId,
-        session.fullName,
-        now,
-        body.notes || 'Application submitted'
-      );
-
-      // Record audit
-      db.prepare('INSERT INTO audit_trail VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
-        'aud-' + Date.now().toString(36),
-        session.userId,
-        session.fullName,
-        'application_submitted',
-        'application',
-        appId,
-        `Submitted application ${appNumber} (${body.programName})`,
-        null,
-        null,
-        '127.0.0.1',
-        now
-      );
-
-      return sendJSON(res, 201, { success: true, applicationId: appId, applicationNumber: appNumber });
-    }
-
-    // 8. Applications: Advance Stage
-    if (pathname.match(/^\/api\/applications\/[^/]+\/advance$/) && method === 'POST') {
-      const id = pathname.split('/')[3];
-      const body = await parseBody(req);
-      const result = WorkflowEngine.advanceStage(id, body.nextStage, body.notes, session);
-      return sendJSON(res, result.success ? 200 : 400, result);
-    }
-
-    // 9. Applications: Return
-    if (pathname.match(/^\/api\/applications\/[^/]+\/return$/) && method === 'POST') {
-      const id = pathname.split('/')[3];
-      const body = await parseBody(req);
-      const result = WorkflowEngine.returnApplication(id, body.returnReason, session);
-      return sendJSON(res, result.success ? 200 : 400, result);
-    }
-
-    // 10. Applications: Approve
-    if (pathname.match(/^\/api\/applications\/[^/]+\/approve$/) && method === 'POST') {
-      const id = pathname.split('/')[3];
-      const body = await parseBody(req);
-      const result = WorkflowEngine.approveApplication(id, body.notes, session);
-      return sendJSON(res, result.success ? 200 : 400, result);
-    }
-
-    // 11. Applications: Reject
-    if (pathname.match(/^\/api\/applications\/[^/]+\/reject$/) && method === 'POST') {
-      const id = pathname.split('/')[3];
-      const body = await parseBody(req);
-      const result = WorkflowEngine.rejectApplication(id, body.rejectionReason, session);
-      return sendJSON(res, result.success ? 200 : 400, result);
-    }
-
-    // 12. EVC Events: List
-    if (pathname === '/api/evc' && method === 'GET') {
-      const scope = getScopeClause(session);
-      let query = `SELECT * FROM evc_events WHERE 1=1`;
-      const params = [];
-      if (session.role === 'committee') {
-        query += ' AND (committee_id = ? OR committee_id IS NULL)';
-        params.push(session.userId);
-      } else if (session.role === 'regional_officer') {
-        query += ' AND region = ?';
-        params.push(session.region);
+      // 12. Applications: Approve
+      if (pathname.match(/^\/api\/applications\/[^/]+\/approve$/) && method === 'POST') {
+        const id = pathname.split('/')[3];
+        const body = await parseBody(req);
+        const result = WorkflowEngine.approveApplication(id, body.notes, session);
+        if (!result.success) {
+          const status = result.error.includes('Unauthorized') ? 403 : 400;
+          return sendProblem(res, status, 'Approval Error', result.error, pathname);
+        }
+        return sendJSON(res, 200, result);
       }
-      query += ' ORDER BY created_at DESC';
-      const events = db.prepare(query).all(...params);
-      return sendJSON(res, 200, { evcEvents: events });
-    }
 
-    // 13. EVC: Schedule
-    if (pathname.match(/^\/api\/evc\/[^/]+\/schedule$/) && method === 'POST') {
-      const id = pathname.split('/')[3];
-      const body = await parseBody(req);
-      const now = new Date().toISOString();
+      // 13. Applications: Reject
+      if (pathname.match(/^\/api\/applications\/[^/]+\/reject$/) && method === 'POST') {
+        const id = pathname.split('/')[3];
+        const body = await parseBody(req);
+        if (!body.rejectionReason || !body.rejectionReason.trim()) {
+          return sendProblem(res, 400, 'Bad Request', 'A mandatory rejectionReason must be specified', pathname);
+        }
+        const result = WorkflowEngine.rejectApplication(id, body.rejectionReason, session);
+        if (!result.success) {
+          const status = result.error.includes('Unauthorized') ? 403 : 400;
+          return sendProblem(res, status, 'Rejection Error', result.error, pathname);
+        }
+        return sendJSON(res, 200, result);
+      }
 
-      const expert = db.prepare('SELECT id, full_name FROM users WHERE id = ?').get(body.expertId);
-      if (!expert) return sendJSON(res, 400, { error: 'Invalid committee expert selected' });
+      // 14. EVC Events: List
+      if (pathname === '/api/evc' && method === 'GET') {
+        const scope = getScopeClause(session, 'evc_events');
+        const events = db.prepare(`SELECT * FROM evc_events WHERE ${scope.sql} ORDER BY created_at DESC`).all(...scope.params);
+        return sendJSON(res, 200, { evcEvents: events });
+      }
 
-      db.prepare(`
-        UPDATE evc_events
-        SET status = 'scheduled',
-            committee_id = ?,
-            committee_name = ?,
-            planned_date = ?,
-            notes = ?,
-            updated_at = ?
-        WHERE id = ?
-      `).run(expert.id, expert.full_name, body.plannedDate, body.notes || '', now, id);
+      // 15. EVC: Schedule
+      if (pathname.match(/^\/api\/evc\/[^/]+\/schedule$/) && method === 'POST') {
+        if (!hasPermission(session.role, 'manage_evc')) {
+          return sendProblem(res, 403, 'Forbidden', 'Unauthorized: You do not have permission to schedule EVC inspections', pathname);
+        }
 
-      const evt = db.prepare('SELECT * FROM evc_events WHERE id = ?').get(id);
+        const id = pathname.split('/')[3];
+        const evt = db.prepare('SELECT * FROM evc_events WHERE id = ?').get(id);
+        if (!evt) return sendProblem(res, 404, 'Not Found', 'EVC Event not found', pathname);
 
-      // Advance app status if pending
-      if (evt && evt.application_id) {
+        // Check regional jurisdiction
+        if (session.role === 'regional_officer' && evt.region !== session.region) {
+          return sendProblem(res, 403, 'Forbidden', 'Access Denied: EVC event is outside your regional jurisdiction', pathname);
+        }
+
+        const body = await parseBody(req);
+        if (!body.expertId || !body.plannedDate) {
+          return sendProblem(res, 400, 'Bad Request', 'expertId and plannedDate are required', pathname);
+        }
+
+        const expert = db.prepare('SELECT id, full_name FROM users WHERE id = ?').get(body.expertId);
+        if (!expert) return sendProblem(res, 400, 'Bad Request', 'Invalid committee expert selected', pathname);
+
+        const now = new Date().toISOString();
+
         db.prepare(`
-          UPDATE applications
-          SET status = 'evc-scheduled', current_stage = 'evc-scheduled', updated_at = ?
-          WHERE id = ? AND status = 'evc-pending'
-        `).run(now, evt.application_id);
-      }
-
-      // Record audit
-      db.prepare('INSERT INTO audit_trail VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
-        'aud-' + Date.now().toString(36),
-        session.userId,
-        session.fullName,
-        'evc_scheduled',
-        'evc',
-        id,
-        `Scheduled EVC inspection for ${evt.institution_name} on ${body.plannedDate} lead by ${expert.full_name}`,
-        null,
-        null,
-        '127.0.0.1',
-        now
-      );
-
-      return sendJSON(res, 200, { success: true, message: 'EVC inspection scheduled successfully' });
-    }
-
-    // 14. EVC: Submit Report
-    if (pathname.match(/^\/api\/evc\/[^/]+\/report$/) && method === 'POST') {
-      const id = pathname.split('/')[3];
-      const body = await parseBody(req);
-      const now = new Date().toISOString();
-
-      const fullReport = `[Recommendation: ${(body.recommendation || 'FAVORABLE').toUpperCase()}]\n${body.report}`;
-
-      db.prepare(`
-        UPDATE evc_events
-        SET status = 'completed',
-            completed_date = ?,
-            report = ?,
-            updated_at = ?
-        WHERE id = ?
-      `).run(body.completedDate || now.split('T')[0], fullReport, now, id);
-
-      const evt = db.prepare('SELECT * FROM evc_events WHERE id = ?').get(id);
-
-      if (evt && evt.application_id) {
-        db.prepare(`
-          UPDATE applications
-          SET status = 'evc-completed', current_stage = 'evc-completed', updated_at = ?
+          UPDATE evc_events
+          SET status = 'scheduled',
+              committee_id = ?,
+              committee_name = ?,
+              planned_date = ?,
+              notes = ?,
+              updated_at = ?
           WHERE id = ?
-        `).run(now, evt.application_id);
+        `).run(expert.id, expert.full_name, body.plannedDate, body.notes || '', now, id);
 
-        db.prepare('INSERT INTO stage_history VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
-          'hist-' + Date.now().toString(36),
-          evt.application_id,
-          'evc-completed',
-          'EVC Inspection Report Filed',
+        // Advance app status if pending
+        if (evt.application_id) {
+          db.prepare(`
+            UPDATE applications
+            SET status = 'evc-scheduled', current_stage = 'evc-scheduled', updated_at = ?
+            WHERE id = ? AND status = 'evc-pending'
+          `).run(now, evt.application_id);
+        }
+
+        // Record audit
+        db.prepare('INSERT INTO audit_trail VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
+          'aud-' + Date.now().toString(36),
           session.userId,
           session.fullName,
-          now,
-          fullReport
+          'evc_scheduled',
+          'evc',
+          id,
+          `Scheduled EVC inspection for ${evt.institution_name} on ${body.plannedDate} led by ${expert.full_name}`,
+          JSON.stringify({ status: evt.status }),
+          JSON.stringify({ status: 'scheduled', plannedDate: body.plannedDate, expert: expert.full_name }),
+          req.socket.remoteAddress || '127.0.0.1',
+          now
         );
+
+        return sendJSON(res, 200, { success: true, message: 'EVC inspection scheduled successfully' });
       }
 
-      // Audit
-      db.prepare('INSERT INTO audit_trail VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
-        'aud-' + Date.now().toString(36),
-        session.userId,
-        session.fullName,
-        'evc_completed',
-        'evc',
-        id,
-        `EVC report filed for ${evt.institution_name}: ${body.recommendation}`,
-        null,
-        null,
-        '127.0.0.1',
-        now
-      );
+      // 16. EVC: Submit Report
+      if (pathname.match(/^\/api\/evc\/[^/]+\/report$/) && method === 'POST') {
+        const id = pathname.split('/')[3];
+        const evt = db.prepare('SELECT * FROM evc_events WHERE id = ?').get(id);
+        if (!evt) return sendProblem(res, 404, 'Not Found', 'EVC Event not found', pathname);
 
-      return sendJSON(res, 200, { success: true, message: 'EVC report filed successfully' });
-    }
+        // Authorization check: must be assigned expert, regional officer of region, or admin
+        const isAssignedExpert = session.role === 'committee' && evt.committee_id === session.userId;
+        const isRegionalOfficer = session.role === 'regional_officer' && evt.region === session.region;
+        const isExecutive = ['bureau_officer', 'admin'].includes(session.role);
 
-    // 15. Undertakings: List
-    if (pathname === '/api/undertakings' && method === 'GET') {
-      const scope = getScopeClause(session);
-      let query = `SELECT * FROM undertakings WHERE ${scope.sql} ORDER BY due_date ASC`;
-      const unds = db.prepare(query).all(...scope.params);
+        if (!isAssignedExpert && !isRegionalOfficer && !isExecutive) {
+          return sendProblem(res, 403, 'Forbidden', 'Access Denied: You are not authorized to file a report for this EVC event', pathname);
+        }
 
-      // Attach submissions
-      for (const u of unds) {
-        u.submissions = db.prepare('SELECT * FROM undertaking_submissions WHERE undertaking_id = ? ORDER BY submitted_at ASC').all(u.id);
+        const body = await parseBody(req);
+        if (!body.report || !body.report.trim()) {
+          return sendProblem(res, 400, 'Bad Request', 'Formal inspection report text is required', pathname);
+        }
+
+        const now = new Date().toISOString();
+        const recommendation = (body.recommendation || 'FAVORABLE').toUpperCase();
+        const fullReport = `[Recommendation: ${recommendation}]\n${body.report.trim()}`;
+
+        db.prepare(`
+          UPDATE evc_events
+          SET status = 'completed',
+              completed_date = ?,
+              report = ?,
+              updated_at = ?
+          WHERE id = ?
+        `).run(body.completedDate || now.split('T')[0], fullReport, now, id);
+
+        if (evt.application_id) {
+          db.prepare(`
+            UPDATE applications
+            SET status = 'evc-completed', current_stage = 'evc-completed', updated_at = ?
+            WHERE id = ?
+          `).run(now, evt.application_id);
+
+          db.prepare('INSERT INTO stage_history VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+            'hist-' + Date.now().toString(36),
+            evt.application_id,
+            'evc-completed',
+            'EVC Inspection Report Filed',
+            session.userId,
+            session.fullName,
+            now,
+            fullReport
+          );
+        }
+
+        // Audit
+        db.prepare('INSERT INTO audit_trail VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
+          'aud-' + Date.now().toString(36),
+          session.userId,
+          session.fullName,
+          'evc_completed',
+          'evc',
+          id,
+          `EVC report filed for ${evt.institution_name}: ${recommendation}`,
+          JSON.stringify({ status: evt.status }),
+          JSON.stringify({ status: 'completed', recommendation }),
+          req.socket.remoteAddress || '127.0.0.1',
+          now
+        );
+
+        return sendJSON(res, 200, { success: true, message: 'EVC report filed successfully' });
       }
 
-      return sendJSON(res, 200, { undertakings: unds });
-    }
+      // 17. Undertakings: List
+      if (pathname === '/api/undertakings' && method === 'GET') {
+        const scope = getScopeClause(session, 'undertakings');
+        let query = `SELECT * FROM undertakings WHERE ${scope.sql} ORDER BY due_date ASC`;
+        const unds = db.prepare(query).all(...scope.params);
 
-    // 16. Undertakings: Create
-    if (pathname === '/api/undertakings' && method === 'POST') {
-      const body = await parseBody(req);
-      const inst = db.prepare('SELECT * FROM institutions WHERE id = ?').get(body.institutionId);
-      if (!inst) return sendJSON(res, 400, { error: 'Invalid institution' });
+        for (const u of unds) {
+          u.submissions = db.prepare('SELECT * FROM undertaking_submissions WHERE undertaking_id = ? ORDER BY submitted_at ASC').all(u.id);
+        }
 
-      const id = 'und-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
-      const now = new Date().toISOString();
-
-      db.prepare(`
-        INSERT INTO undertakings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        id,
-        body.applicationId || null,
-        inst.id,
-        inst.name,
-        body.condition,
-        body.dueDate,
-        body.requiredEvidence,
-        'pending',
-        body.verificationOwnerId || session.userId,
-        body.verificationOwnerName || session.fullName,
-        inst.region,
-        now,
-        now
-      );
-
-      return sendJSON(res, 201, { success: true, undertakingId: id });
-    }
-
-    // 17. Undertakings: Submit Evidence
-    if (pathname.match(/^\/api\/undertakings\/[^/]+\/submit-evidence$/) && method === 'POST') {
-      const id = pathname.split('/')[3];
-      const body = await parseBody(req);
-      const now = new Date().toISOString();
-
-      const subId = 'sub-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
-      db.prepare(`
-        INSERT INTO undertaking_submissions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        subId,
-        id,
-        body.fileName || 'compliance_evidence.pdf',
-        body.storedPath || null,
-        now,
-        session.userId,
-        session.fullName,
-        'under-review',
-        body.notes || ''
-      );
-
-      db.prepare("UPDATE undertakings SET status = 'submitted', updated_at = ? WHERE id = ?").run(now, id);
-
-      return sendJSON(res, 200, { success: true, submissionId: subId });
-    }
-
-    // 18. Undertakings: Review
-    if (pathname.match(/^\/api\/undertakings\/[^/]+\/review$/) && method === 'POST') {
-      const id = pathname.split('/')[3];
-      const body = await parseBody(req);
-      const now = new Date().toISOString();
-
-      db.prepare("UPDATE undertakings SET status = ?, updated_at = ? WHERE id = ?").run(body.decision, now, id);
-
-      db.prepare(`
-        UPDATE undertaking_submissions
-        SET status = ?, review_notes = ?
-        WHERE undertaking_id = ?
-        ORDER BY submitted_at DESC LIMIT 1
-      `).run(body.decision === 'verified' ? 'accepted' : body.decision, body.reviewNotes || '', id);
-
-      return sendJSON(res, 200, { success: true, status: body.decision });
-    }
-
-    // 19. Documents: List
-    if (pathname === '/api/documents' && method === 'GET') {
-      const scope = getScopeClause(session);
-      const docs = db.prepare(`SELECT * FROM documents WHERE ${scope.sql} ORDER BY expiry_date ASC`).all(...scope.params);
-      return sendJSON(res, 200, { documents: docs });
-    }
-
-    // 20. Documents: Add
-    if (pathname === '/api/documents' && method === 'POST') {
-      const body = await parseBody(req);
-      const inst = db.prepare('SELECT * FROM institutions WHERE id = ?').get(session.institutionId || body.institutionId);
-      if (!inst) return sendJSON(res, 400, { error: 'Invalid institution' });
-
-      const id = 'doc-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
-      const now = new Date().toISOString();
-
-      db.prepare(`
-        INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        id,
-        inst.id,
-        inst.name,
-        body.type,
-        body.description || '',
-        body.issueDate,
-        body.effectiveDate || body.issueDate,
-        body.expiryDate || null,
-        'valid',
-        body.fileName || 'document.pdf',
-        body.storedPath || null,
-        inst.region,
-        null,
-        'pending',
-        null,
-        null,
-        now,
-        now
-      );
-
-      return sendJSON(res, 201, { success: true, documentId: id });
-    }
-
-    // 21. Documents: Renew
-    if (pathname.match(/^\/api\/documents\/[^/]+\/renew$/) && method === 'POST') {
-      const id = pathname.split('/')[3];
-      const body = await parseBody(req);
-      const now = new Date().toISOString();
-
-      db.prepare(`
-        UPDATE documents
-        SET issue_date = ?,
-            expiry_date = ?,
-            file_name = ?,
-            status = 'valid',
-            renewal_status = 'renewed',
-            verification_status = 'pending',
-            updated_at = ?
-        WHERE id = ?
-      `).run(body.issueDate, body.expiryDate, body.fileName, now, id);
-
-      return sendJSON(res, 200, { success: true, message: 'Document renewal submitted' });
-    }
-
-    // 22. Documents: Verify
-    if (pathname.match(/^\/api\/documents\/[^/]+\/verify$/) && method === 'POST') {
-      const id = pathname.split('/')[3];
-      const now = new Date().toISOString();
-
-      db.prepare(`
-        UPDATE documents
-        SET verification_status = 'verified',
-            verified_by = ?,
-            verified_date = ?,
-            updated_at = ?
-        WHERE id = ?
-      `).run(session.userId, now, now, id);
-
-      return sendJSON(res, 200, { success: true, message: 'Document verified' });
-    }
-
-    // 23. Notifications: List
-    if (pathname === '/api/notifications' && method === 'GET') {
-      const notifs = db.prepare(`
-        SELECT * FROM notifications
-        WHERE recipient_id = ?
-           OR recipient_role = ?
-           OR (recipient_region = ? AND ? IN ('regional_officer', 'bureau_officer'))
-           OR (recipient_institution = ? AND ? = 'institution')
-        ORDER BY created_at DESC
-        LIMIT 50
-      `).all(session.userId, session.role, session.region, session.role, session.institutionId, session.role);
-
-      return sendJSON(res, 200, { notifications: notifs });
-    }
-
-    // 24. Notifications: Mark Read
-    if (pathname.match(/^\/api\/notifications\/[^/]+\/read$/) && method === 'POST') {
-      const id = pathname.split('/')[3];
-      db.prepare('UPDATE notifications SET read = 1 WHERE id = ?').run(id);
-      return sendJSON(res, 200, { success: true });
-    }
-
-    // 25. Notifications: Mark All Read
-    if (pathname === '/api/notifications/read-all' && method === 'POST') {
-      db.prepare(`
-        UPDATE notifications
-        SET read = 1
-        WHERE recipient_id = ? OR recipient_role = ?
-      `).run(session.userId, session.role);
-      return sendJSON(res, 200, { success: true });
-    }
-
-    // 26. Notifications: Simulate Escalation
-    if (pathname === '/api/notifications/simulate-escalation' && method === 'POST') {
-      const id = 'ntf-' + Date.now().toString(36);
-      const now = new Date().toISOString();
-      db.prepare(`
-        INSERT INTO notifications VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        id,
-        'escalation',
-        'CRITICAL ESCALATION: SLA Stage Breach Alert',
-        `Urgent escalation triggered: Application FG/SR/2026/0003 overdue by 5+ days. Escalated for senior officer review.`,
-        session.userId,
-        session.role,
-        session.region,
-        null,
-        'application',
-        'app-007',
-        2,
-        0,
-        'delivered',
-        now
-      );
-      return sendJSON(res, 200, { success: true, notificationId: id });
-    }
-
-    // 27. Reports & Analytics
-    if (pathname === '/api/reports/stats' && method === 'GET') {
-      const totalApps = db.prepare('SELECT COUNT(*) as c FROM applications').get().c;
-      const approvedApps = db.prepare("SELECT COUNT(*) as c FROM applications WHERE status = 'approved'").get().c;
-      const overdueApps = db.prepare("SELECT COUNT(*) as c FROM applications WHERE current_stage_due_date < date('now') AND status NOT IN ('approved', 'rejected', 'cancelled')").get().c;
-      const pendingUnd = db.prepare("SELECT COUNT(*) as c FROM undertakings WHERE status IN ('pending', 'overdue')").get().c;
-      const verifiedUnd = db.prepare("SELECT COUNT(*) as c FROM undertakings WHERE status = 'verified'").get().c;
-      const totalUnd = db.prepare('SELECT COUNT(*) as c FROM undertakings').get().c;
-
-      const stageCounts = db.prepare('SELECT current_stage as stage, COUNT(*) as count FROM applications GROUP BY current_stage').all();
-      const regionPerformance = db.prepare(`
-        SELECT r.id, r.name, r.code, r.states,
-               COUNT(a.id) as total,
-               SUM(CASE WHEN a.status = 'approved' THEN 1 ELSE 0 END) as approved,
-               SUM(CASE WHEN a.current_stage_due_date < date('now') AND a.status NOT IN ('approved', 'rejected') THEN 1 ELSE 0 END) as overdue
-        FROM regions r
-        LEFT JOIN applications a ON r.id = a.region
-        GROUP BY r.id
-      `).all();
-
-      regionPerformance.forEach(r => {
-        try { r.states = JSON.parse(r.states); } catch(e) { r.states = []; }
-        r.sla = r.total > 0 ? Math.round(((r.total - r.overdue) / r.total) * 100) : 100;
-      });
-
-      return sendJSON(res, 200, {
-        kpis: {
-          totalApplications: totalApps,
-          approvedApplications: approvedApps,
-          overdueApplications: overdueApps,
-          approvalRate: totalApps > 0 ? Math.round((approvedApps / totalApps) * 100) : 0,
-          slaComplianceRate: totalApps > 0 ? Math.round(((totalApps - overdueApps) / totalApps) * 100) : 100,
-          undertakingsComplianceRate: totalUnd > 0 ? Math.round((verifiedUnd / totalUnd) * 100) : 0,
-          pendingUndertakings: pendingUnd
-        },
-        stageCounts,
-        regionPerformance
-      });
-    }
-
-    // 28. Audit Trail: List
-    if (pathname === '/api/audit' && method === 'GET') {
-      const audits = db.prepare('SELECT * FROM audit_trail ORDER BY timestamp DESC LIMIT 100').all();
-      return sendJSON(res, 200, { audits });
-    }
-
-    // 29. Admin: Workflows
-    if (pathname === '/api/admin/workflows' && method === 'GET') {
-      const tmpls = db.prepare('SELECT * FROM workflow_templates').all();
-      tmpls.forEach(t => {
-        try { t.stages = JSON.parse(t.stages); } catch(e) {}
-        try { t.applicableTo = JSON.parse(t.applicable_to); } catch(e) {}
-      });
-      return sendJSON(res, 200, { templates: tmpls });
-    }
-
-    // 30. Admin: Escalation Rules
-    if (pathname === '/api/admin/escalation-rules' && method === 'GET') {
-      const rules = db.prepare('SELECT * FROM escalation_rules').all();
-      return sendJSON(res, 200, { escalationRules: rules });
-    }
-
-    // 31. Admin: Users
-    if (pathname === '/api/admin/users' && method === 'GET') {
-      const users = db.prepare('SELECT id, username, full_name, role, region, institution_id, email, active, created_at FROM users').all();
-      return sendJSON(res, 200, { users });
-    }
-
-    // 32. Admin: Reset Demo Data
-    if (pathname === '/api/admin/reset-seed' && method === 'POST') {
-      if (session.role !== 'admin') {
-        return sendJSON(res, 403, { error: 'Admin role required' });
+        return sendJSON(res, 200, { undertakings: unds });
       }
-      seedDatabase(true);
-      return sendJSON(res, 200, { success: true, message: 'Database reset to demo seed data' });
-    }
 
-    // 33. Scheduler: Manual Trigger
-    if (pathname === '/api/scheduler/run' && method === 'POST') {
-      const summary = Scheduler.runSchedulerOnce();
-      return sendJSON(res, 200, { success: true, summary });
-    }
+      // 18. Undertakings: Create (Restricted to Officers/Admin)
+      if (pathname === '/api/undertakings' && method === 'POST') {
+        if (!hasPermission(session.role, 'assign_undertaking')) {
+          return sendProblem(res, 403, 'Forbidden', 'Unauthorized: Only authorized officers can create institutional undertakings', pathname);
+        }
 
-    // 34. AI Assistant: Summarize Application
-    if (pathname === '/api/ai/summarize-application' && method === 'POST') {
-      const body = await parseBody(req);
-      const summary = await AIService.summarizeApplication(body.applicationId);
-      return sendJSON(res, 200, summary);
-    }
+        const body = await parseBody(req);
+        if (!body.institutionId || !body.condition || !body.dueDate || !body.requiredEvidence) {
+          return sendProblem(res, 400, 'Bad Request', 'institutionId, condition, dueDate, and requiredEvidence are required', pathname);
+        }
 
-    // 35. AI Assistant: Document Checklist
-    if (pathname === '/api/ai/document-checklist' && method === 'POST') {
-      const body = await parseBody(req);
-      const checklist = AIService.generateChecklist(body.applicationType);
-      return sendJSON(res, 200, checklist);
-    }
+        const inst = db.prepare('SELECT * FROM institutions WHERE id = ?').get(body.institutionId);
+        if (!inst) return sendProblem(res, 400, 'Bad Request', 'Invalid institution ID', pathname);
 
-    // 36. AI Assistant: Search Assistant
-    if (pathname === '/api/ai/search-assistant' && method === 'POST') {
-      const body = await parseBody(req);
-      const result = AIService.regulatorySearch(body.query);
-      return sendJSON(res, 200, result);
-    }
+        if (session.role === 'regional_officer' && inst.region !== session.region) {
+          return sendProblem(res, 403, 'Forbidden', 'Access Denied: Institution is outside your regional jurisdiction', pathname);
+        }
 
-    // Unmatched API endpoint
-    return sendJSON(res, 404, { error: 'API endpoint not found' });
+        const id = 'und-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
+        const now = new Date().toISOString();
+
+        db.prepare(`
+          INSERT INTO undertakings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          id,
+          body.applicationId || null,
+          inst.id,
+          inst.name,
+          body.condition.trim(),
+          body.dueDate,
+          body.requiredEvidence.trim(),
+          'pending',
+          session.userId,
+          session.fullName,
+          inst.region,
+          now,
+          now
+        );
+
+        return sendJSON(res, 201, { success: true, undertakingId: id });
+      }
+
+      // 19. Undertakings: Submit Evidence
+      if (pathname.match(/^\/api\/undertakings\/[^/]+\/submit-evidence$/) && method === 'POST') {
+        const id = pathname.split('/')[3];
+        const und = db.prepare('SELECT * FROM undertakings WHERE id = ?').get(id);
+        if (!und) return sendProblem(res, 404, 'Not Found', 'Undertaking not found', pathname);
+
+        // Verification: If caller is institution user, it MUST match the undertaking's institution
+        if (session.role === 'institution' && und.institution_id !== session.institutionId) {
+          return sendProblem(res, 403, 'Forbidden', 'Access Denied: You cannot submit evidence for another institution', pathname);
+        }
+
+        const body = await parseBody(req);
+        const now = new Date().toISOString();
+        const subId = 'sub-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
+
+        db.prepare(`
+          INSERT INTO undertaking_submissions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          subId,
+          id,
+          body.fileName || 'compliance_evidence.pdf',
+          body.storedPath || null,
+          now,
+          session.userId,
+          session.fullName,
+          'under-review',
+          body.notes || ''
+        );
+
+        db.prepare("UPDATE undertakings SET status = 'submitted', updated_at = ? WHERE id = ?").run(now, id);
+
+        return sendJSON(res, 200, { success: true, submissionId: subId });
+      }
+
+      // 20. Undertakings: Review
+      if (pathname.match(/^\/api\/undertakings\/[^/]+\/review$/) && method === 'POST') {
+        if (!hasPermission(session.role, 'review_undertaking')) {
+          return sendProblem(res, 403, 'Forbidden', 'Unauthorized: Only authorized officers can review compliance undertakings', pathname);
+        }
+
+        const id = pathname.split('/')[3];
+        const und = db.prepare('SELECT * FROM undertakings WHERE id = ?').get(id);
+        if (!und) return sendProblem(res, 404, 'Not Found', 'Undertaking not found', pathname);
+
+        if (session.role === 'regional_officer' && und.region !== session.region) {
+          return sendProblem(res, 403, 'Forbidden', 'Access Denied: Undertaking is outside your regional jurisdiction', pathname);
+        }
+
+        const body = await parseBody(req);
+        if (!body.decision || !['verified', 'rejected'].includes(body.decision)) {
+          return sendProblem(res, 400, 'Bad Request', "Decision must be 'verified' or 'rejected'", pathname);
+        }
+
+        const now = new Date().toISOString();
+
+        db.prepare("UPDATE undertakings SET status = ?, updated_at = ? WHERE id = ?").run(body.decision, now, id);
+
+        db.prepare(`
+          UPDATE undertaking_submissions
+          SET status = ?, review_notes = ?
+          WHERE undertaking_id = ?
+        `).run(body.decision === 'verified' ? 'accepted' : 'rejected', body.reviewNotes || '', id);
+
+        return sendJSON(res, 200, { success: true, status: body.decision });
+      }
+
+      // 21. Documents: List
+      if (pathname === '/api/documents' && method === 'GET') {
+        const scope = getScopeClause(session, 'documents');
+        const docs = db.prepare(`SELECT * FROM documents WHERE ${scope.sql} ORDER BY expiry_date ASC`).all(...scope.params);
+        return sendJSON(res, 200, { documents: docs });
+      }
+
+      // 22. Documents: Add
+      if (pathname === '/api/documents' && method === 'POST') {
+        if (!hasPermission(session.role, 'upload_document')) {
+          return sendProblem(res, 403, 'Forbidden', 'Unauthorized: Role cannot upload statutory documents', pathname);
+        }
+
+        const body = await parseBody(req);
+        if (!body.type || !body.issueDate) {
+          return sendProblem(res, 400, 'Bad Request', 'type and issueDate are required', pathname);
+        }
+
+        let instId = session.institutionId;
+        if (session.role !== 'institution' && body.institutionId) {
+          instId = body.institutionId;
+        }
+        if (!instId) return sendProblem(res, 400, 'Bad Request', 'Valid institutionId required', pathname);
+
+        const inst = db.prepare('SELECT * FROM institutions WHERE id = ?').get(instId);
+        if (!inst) return sendProblem(res, 400, 'Bad Request', 'Invalid institution ID', pathname);
+
+        if (session.role === 'regional_officer' && inst.region !== session.region) {
+          return sendProblem(res, 403, 'Forbidden', 'Access Denied: Institution is outside your regional jurisdiction', pathname);
+        }
+
+        const id = 'doc-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
+        const now = new Date().toISOString();
+
+        db.prepare(`
+          INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          id,
+          inst.id,
+          inst.name,
+          body.type.trim(),
+          body.description || '',
+          body.issueDate,
+          body.effectiveDate || body.issueDate,
+          body.expiryDate || null,
+          'valid',
+          body.fileName || 'document.pdf',
+          body.storedPath || null,
+          inst.region,
+          null,
+          'pending',
+          null,
+          null,
+          now,
+          now
+        );
+
+        return sendJSON(res, 201, { success: true, documentId: id });
+      }
+
+      // 23. Documents: Renew
+      if (pathname.match(/^\/api\/documents\/[^/]+\/renew$/) && method === 'POST') {
+        if (!hasPermission(session.role, 'renew_document')) {
+          return sendProblem(res, 403, 'Forbidden', 'Unauthorized: Role cannot file document renewals', pathname);
+        }
+
+        const id = pathname.split('/')[3];
+        const doc = db.prepare('SELECT * FROM documents WHERE id = ?').get(id);
+        if (!doc) return sendProblem(res, 404, 'Not Found', 'Document not found', pathname);
+
+        if (session.role === 'institution' && doc.institution_id !== session.institutionId) {
+          return sendProblem(res, 403, 'Forbidden', 'Access Denied: Cannot renew document for another institution', pathname);
+        }
+
+        const body = await parseBody(req);
+        if (!body.issueDate || !body.expiryDate) {
+          return sendProblem(res, 400, 'Bad Request', 'Updated issueDate and expiryDate are required', pathname);
+        }
+
+        const now = new Date().toISOString();
+
+        db.prepare(`
+          UPDATE documents
+          SET issue_date = ?,
+              expiry_date = ?,
+              file_name = ?,
+              stored_path = COALESCE(?, stored_path),
+              status = 'valid',
+              renewal_status = 'renewed',
+              verification_status = 'pending',
+              updated_at = ?
+          WHERE id = ?
+        `).run(body.issueDate, body.expiryDate, body.fileName || doc.file_name, body.storedPath || null, now, id);
+
+        return sendJSON(res, 200, { success: true, message: 'Document renewal submitted' });
+      }
+
+      // 24. Documents: Verify
+      if (pathname.match(/^\/api\/documents\/[^/]+\/verify$/) && method === 'POST') {
+        if (!hasPermission(session.role, 'verify_document')) {
+          return sendProblem(res, 403, 'Forbidden', 'Unauthorized: Role cannot verify documents', pathname);
+        }
+
+        const id = pathname.split('/')[3];
+        const doc = db.prepare('SELECT * FROM documents WHERE id = ?').get(id);
+        if (!doc) return sendProblem(res, 404, 'Not Found', 'Document not found', pathname);
+
+        if (session.role === 'regional_officer' && doc.region !== session.region) {
+          return sendProblem(res, 403, 'Forbidden', 'Access Denied: Document is outside your regional jurisdiction', pathname);
+        }
+
+        const now = new Date().toISOString();
+
+        db.prepare(`
+          UPDATE documents
+          SET verification_status = 'verified',
+              verified_by = ?,
+              verified_date = ?,
+              updated_at = ?
+          WHERE id = ?
+        `).run(session.userId, now, now, id);
+
+        return sendJSON(res, 200, { success: true, message: 'Document verified' });
+      }
+
+      // 25. Notifications: List
+      if (pathname === '/api/notifications' && method === 'GET') {
+        const scope = getScopeClause(session, 'notifications');
+        const notifs = db.prepare(`
+          SELECT * FROM notifications
+          WHERE ${scope.sql}
+          ORDER BY created_at DESC
+          LIMIT 50
+        `).all(...scope.params);
+
+        return sendJSON(res, 200, { notifications: notifs });
+      }
+
+      // 26. Notifications: Mark Read
+      if (pathname.match(/^\/api\/notifications\/[^/]+\/read$/) && method === 'POST') {
+        const id = pathname.split('/')[3];
+        const notif = db.prepare('SELECT * FROM notifications WHERE id = ?').get(id);
+        if (!notif) return sendProblem(res, 404, 'Not Found', 'Notification not found', pathname);
+
+        // Verify recipient ownership
+        const isRecipient = (notif.recipient_id === session.userId) ||
+          (notif.recipient_role === session.role) ||
+          (notif.recipient_region === session.region) ||
+          (notif.recipient_institution === session.institutionId);
+
+        if (!isRecipient && session.role !== 'admin') {
+          return sendProblem(res, 403, 'Forbidden', 'Access Denied: Notification not addressed to your session', pathname);
+        }
+
+        db.prepare('UPDATE notifications SET read = 1 WHERE id = ?').run(id);
+        return sendJSON(res, 200, { success: true });
+      }
+
+      // 27. Notifications: Mark All Read
+      if (pathname === '/api/notifications/read-all' && method === 'POST') {
+        const scope = getScopeClause(session, 'notifications');
+        db.prepare(`UPDATE notifications SET read = 1 WHERE ${scope.sql}`).run(...scope.params);
+        return sendJSON(res, 200, { success: true });
+      }
+
+      // 28. Notifications: Trigger Sample In-App Escalation Alert
+      if (pathname === '/api/notifications/simulate-escalation' && method === 'POST') {
+        const id = 'ntf-' + Date.now().toString(36);
+        const now = new Date().toISOString();
+        db.prepare(`
+          INSERT INTO notifications VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          id,
+          'escalation',
+          'CRITICAL ESCALATION: SLA Stage Breach Alert',
+          'Sample in-app escalation: Application SLA exceeded. Escalated for officer review.',
+          session.userId,
+          session.role,
+          session.region,
+          null,
+          'application',
+          'app-007',
+          2,
+          0,
+          'in_app',
+          now
+        );
+        return sendJSON(res, 200, { success: true, notificationId: id, channel: 'in_app' });
+      }
+
+      // 29. Reports & Analytics (Properly Scoped)
+      if (pathname === '/api/reports/stats' && method === 'GET') {
+        let appFilter = '1=1';
+        let undFilter = '1=1';
+        const params = [];
+
+        if (session.role === 'institution') {
+          appFilter = 'institution_id = ?';
+          undFilter = 'institution_id = ?';
+          params.push(session.institutionId);
+        } else if (session.role === 'regional_officer') {
+          appFilter = 'region = ?';
+          undFilter = 'region = ?';
+          params.push(session.region);
+        }
+
+        const totalApps = db.prepare(`SELECT COUNT(*) as c FROM applications WHERE ${appFilter}`).get(...params).c;
+        const approvedApps = db.prepare(`SELECT COUNT(*) as c FROM applications WHERE ${appFilter} AND status = 'approved'`).get(...params).c;
+        const overdueApps = db.prepare(`SELECT COUNT(*) as c FROM applications WHERE ${appFilter} AND current_stage_due_date < date('now') AND status NOT IN ('approved', 'rejected', 'cancelled')`).get(...params).c;
+        const pendingUnd = db.prepare(`SELECT COUNT(*) as c FROM undertakings WHERE ${undFilter} AND status IN ('pending', 'overdue')`).get(...params).c;
+        const verifiedUnd = db.prepare(`SELECT COUNT(*) as c FROM undertakings WHERE ${undFilter} AND status = 'verified'`).get(...params).c;
+        const totalUnd = db.prepare(`SELECT COUNT(*) as c FROM undertakings WHERE ${undFilter}`).get(...params).c;
+
+        const stageCounts = db.prepare(`SELECT current_stage as stage, COUNT(*) as count FROM applications WHERE ${appFilter} GROUP BY current_stage`).all(...params);
+
+        let regionPerformance = [];
+        if (session.role === 'regional_officer') {
+          regionPerformance = db.prepare(`
+            SELECT r.id, r.name, r.code, r.states,
+                   COUNT(a.id) as total,
+                   SUM(CASE WHEN a.status = 'approved' THEN 1 ELSE 0 END) as approved,
+                   SUM(CASE WHEN a.current_stage_due_date < date('now') AND a.status NOT IN ('approved', 'rejected') THEN 1 ELSE 0 END) as overdue
+            FROM regions r
+            LEFT JOIN applications a ON r.id = a.region
+            WHERE r.id = ?
+            GROUP BY r.id
+          `).all(session.region);
+        } else if (session.role !== 'institution') {
+          regionPerformance = db.prepare(`
+            SELECT r.id, r.name, r.code, r.states,
+                   COUNT(a.id) as total,
+                   SUM(CASE WHEN a.status = 'approved' THEN 1 ELSE 0 END) as approved,
+                   SUM(CASE WHEN a.current_stage_due_date < date('now') AND a.status NOT IN ('approved', 'rejected') THEN 1 ELSE 0 END) as overdue
+            FROM regions r
+            LEFT JOIN applications a ON r.id = a.region
+            GROUP BY r.id
+          `).all();
+        }
+
+        regionPerformance.forEach(r => {
+          try { r.states = JSON.parse(r.states); } catch(e) { r.states = []; }
+          r.sla = r.total > 0 ? Math.round(((r.total - r.overdue) / r.total) * 100) : 100;
+        });
+
+        return sendJSON(res, 200, {
+          kpis: {
+            totalApplications: totalApps,
+            approvedApplications: approvedApps,
+            overdueApplications: overdueApps,
+            approvalRate: totalApps > 0 ? Math.round((approvedApps / totalApps) * 100) : 0,
+            slaComplianceRate: totalApps > 0 ? Math.round(((totalApps - overdueApps) / totalApps) * 100) : 100,
+            undertakingsComplianceRate: totalUnd > 0 ? Math.round((verifiedUnd / totalUnd) * 100) : 0,
+            pendingUndertakings: pendingUnd
+          },
+          stageCounts,
+          regionPerformance
+        });
+      }
+
+      // 30. Audit Trail: List
+      if (pathname === '/api/audit' && method === 'GET') {
+        if (!hasPermission(session.role, 'view_audit')) {
+          return sendProblem(res, 403, 'Forbidden', 'Unauthorized: Your role does not have permission to view system audit logs', pathname);
+        }
+
+        const scope = getScopeClause(session, 'audit_trail');
+        const audits = db.prepare(`SELECT * FROM audit_trail WHERE ${scope.sql} ORDER BY timestamp DESC LIMIT 100`).all(...scope.params);
+        return sendJSON(res, 200, { audits });
+      }
+
+      // 31. Admin: Workflows
+      if (pathname === '/api/admin/workflows' && method === 'GET') {
+        const tmpls = db.prepare('SELECT * FROM workflow_templates').all();
+        tmpls.forEach(t => {
+          try { t.stages = JSON.parse(t.stages); } catch(e) {}
+          try { t.applicableTo = JSON.parse(t.applicable_to); } catch(e) {}
+        });
+        return sendJSON(res, 200, { templates: tmpls });
+      }
+
+      // 32. Admin: Escalation Rules
+      if (pathname === '/api/admin/escalation-rules' && method === 'GET') {
+        const rules = db.prepare('SELECT * FROM escalation_rules').all();
+        return sendJSON(res, 200, { escalationRules: rules });
+      }
+
+      // 33. Admin: Users
+      if (pathname === '/api/admin/users' && method === 'GET') {
+        const users = db.prepare('SELECT id, username, full_name, role, region, institution_id, email, active, created_at FROM users').all();
+        return sendJSON(res, 200, { users });
+      }
+
+      // 34. Admin: Reset Demo Data
+      if (pathname === '/api/admin/reset-seed' && method === 'POST') {
+        if (session.role !== 'admin') {
+          return sendProblem(res, 403, 'Forbidden', 'Admin role required to reset system seed data', pathname);
+        }
+        seedDatabase(true);
+        return sendJSON(res, 200, { success: true, message: 'Database reset to demo seed data' });
+      }
+
+      // 35. Scheduler: Manual Trigger
+      if (pathname === '/api/scheduler/run' && method === 'POST') {
+        if (!['regional_officer', 'bureau_officer', 'competent_authority', 'admin'].includes(session.role)) {
+          return sendProblem(res, 403, 'Forbidden', 'Unauthorized: Officer or Administrator role required to run scheduler', pathname);
+        }
+        const summary = Scheduler.runSchedulerOnce();
+        return sendJSON(res, 200, { success: true, summary });
+      }
+
+      // 36. AI Assistant: Summarize Application
+      if (pathname === '/api/ai/summarize-application' && method === 'POST') {
+        const body = await parseBody(req);
+        if (!body.applicationId) {
+          return sendProblem(res, 400, 'Bad Request', 'applicationId is required', pathname);
+        }
+        const app = db.prepare('SELECT * FROM applications WHERE id = ?').get(body.applicationId);
+        if (!app) return sendProblem(res, 404, 'Not Found', 'Application not found', pathname);
+
+        // Scoping check
+        if (!canAccessRecord(session, 'applications', app)) {
+          return sendProblem(res, 403, 'Forbidden', 'Access Denied: You do not have permission to view this application summary', pathname);
+        }
+
+        const summary = await AIService.summarizeApplication(body.applicationId);
+        return sendJSON(res, 200, summary);
+      }
+
+      // 37. AI Assistant: Document Checklist
+      if (pathname === '/api/ai/document-checklist' && method === 'POST') {
+        const body = await parseBody(req);
+        const checklist = AIService.generateChecklist(body.applicationType);
+        return sendJSON(res, 200, checklist);
+      }
+
+      // 38. AI Assistant: Search Assistant
+      if (pathname === '/api/ai/search-assistant' && method === 'POST') {
+        const body = await parseBody(req);
+        const result = AIService.regulatorySearch(body.query);
+        return sendJSON(res, 200, result);
+      }
+
+      // Unmatched API endpoint
+      return sendProblem(res, 404, 'Not Found', `API endpoint '${pathname}' not found`, pathname);
+
+    } catch (err) {
+      console.error('[API Server Error]:', err);
+      const status = err.statusCode || 500;
+      return sendProblem(res, status, 'Internal Server Error', err.message || 'An unexpected error occurred', pathname);
+    }
   }
 
-  // -------------------------------------------------------------
-  // STATIC FILE SERVING
-  // -------------------------------------------------------------
+  // =============================================================
+  // HARDENED STATIC ASSET SERVING
+  // =============================================================
   let relativePath = pathname.substring(1);
   if (!relativePath || relativePath === '/') {
     relativePath = 'index.html';
@@ -806,10 +1313,43 @@ const server = http.createServer(async (req, res) => {
 
   const filePath = path.normalize(path.join(PUBLIC_DIR, relativePath));
 
-  // Security check: prevent directory traversal
+  // Security Check 1: Must stay strictly within PUBLIC_DIR
   if (!filePath.startsWith(PUBLIC_DIR)) {
     res.writeHead(403, { 'Content-Type': 'text/plain' });
     res.end('Access Denied');
+    return;
+  }
+
+  // Security Check 2: Block protected internal directories and sensitive files
+  const forbiddenPrefixes = [
+    path.normalize(DATA_DIR),
+    path.normalize(UPLOADS_DIR),
+    path.normalize(path.join(PUBLIC_DIR, '.git')),
+    path.normalize(path.join(PUBLIC_DIR, 'server')),
+    path.normalize(path.join(PUBLIC_DIR, 'tests')),
+    path.normalize(path.join(PUBLIC_DIR, 'node_modules'))
+  ];
+
+  const forbiddenFiles = [
+    'package.json',
+    'package-lock.json',
+    'Dockerfile',
+    'docker-compose.yml',
+    'server.js',
+    'server.ps1',
+    '.env',
+    '.env.example',
+    '.gitignore',
+    '.gitattributes'
+  ];
+
+  const baseFileName = path.basename(filePath);
+  const isForbiddenPrefix = forbiddenPrefixes.some(p => filePath.startsWith(p));
+  const isForbiddenFile = forbiddenFiles.includes(baseFileName) || baseFileName.startsWith('.env');
+
+  if (isForbiddenPrefix || isForbiddenFile) {
+    res.writeHead(403, { 'Content-Type': 'text/plain' });
+    res.end('Access Denied: Protected System Resource');
     return;
   }
 
@@ -846,6 +1386,7 @@ server.listen(PORT, () => {
    🏥 API Health Check    : http://localhost:${PORT}/api/health
    🗄️ Database Engine     : Native node:sqlite (data/flowguard.db)
    ⏱️ SLA Scheduler       : Active (Due date checks & escalations)
+   🔒 Security Status     : RBAC & Data Isolation Enforced
   ==============================================================
   `);
 });
