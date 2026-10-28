@@ -58,6 +58,20 @@ const Auth = {
     }
   },
 
+  // Register institutional user via Backend REST API
+  async register(registrationData) {
+    try {
+      const data = await API.register(registrationData);
+      if (data && data.success && data.user) {
+        Store.setSession(data.user);
+        return { success: true, session: data.user, token: data.token };
+      }
+      return { success: false, error: data.error || data.detail || 'Registration failed' };
+    } catch (err) {
+      return { success: false, error: err.message || 'Registration failed. Please check your details.' };
+    }
+  },
+
   // Terminate session
   async logout() {
     try {

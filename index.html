@@ -57,6 +57,68 @@
           <p class="demo-disclaimer">⚠ Demo configuration — not official AICTE policy</p>
           <div class="demo-account-grid" id="demo-account-grid"></div>
         </div>
+        <div class="auth-toggle-box" style="text-align: center; margin-top: var(--space-4); border-top: 1px solid var(--border-color); padding-top: var(--space-3);">
+          <button type="button" id="show-register-btn" class="btn btn-ghost btn-sm btn-block">
+            <span class="material-icons-round">app_registration</span> New Institution? Register Account
+          </button>
+        </div>
+      </form>
+
+      <form id="register-form" class="login-form" autocomplete="off" hidden style="display: none;">
+        <div style="margin-bottom: var(--space-4); text-align: center;">
+          <h3 style="font-size: var(--font-size-base); font-weight: var(--font-weight-bold); margin-bottom: 4px;">Institutional Representative Registration</h3>
+          <p style="font-size: var(--font-size-xs); color: var(--text-tertiary);">Register an educational institution account for AICTE approval workflows</p>
+        </div>
+        <div class="form-group">
+          <label for="reg-inst-name" class="form-label">
+            <span class="material-icons-round">account_balance</span> Institution Name *
+          </label>
+          <input type="text" id="reg-inst-name" class="form-input" placeholder="e.g. Apex Institute of Engineering" required>
+        </div>
+        <div class="form-group">
+          <label for="reg-region" class="form-label">
+            <span class="material-icons-round">map</span> AICTE Region *
+          </label>
+          <select id="reg-region" class="form-input" required>
+            <option value="reg-north">Northern Region (NR)</option>
+            <option value="reg-south">Southern Region (SR)</option>
+            <option value="reg-west">Western Region (WR)</option>
+            <option value="reg-east">Eastern Region (ER)</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="reg-fullname" class="form-label">
+            <span class="material-icons-round">badge</span> Authorized Representative Name *
+          </label>
+          <input type="text" id="reg-fullname" class="form-input" placeholder="e.g. Dr. Rajesh Sharma" required>
+        </div>
+        <div class="form-group">
+          <label for="reg-email" class="form-label">
+            <span class="material-icons-round">email</span> Institutional Email *
+          </label>
+          <input type="email" id="reg-email" class="form-input" placeholder="e.g. director@apexinstitute.edu.in" required>
+        </div>
+        <div class="form-group">
+          <label for="reg-username" class="form-label">
+            <span class="material-icons-round">person</span> Portal Username *
+          </label>
+          <input type="text" id="reg-username" class="form-input" placeholder="e.g. inst_apex" required autocomplete="username">
+        </div>
+        <div class="form-group">
+          <label for="reg-password" class="form-label">
+            <span class="material-icons-round">lock</span> Password (min. 8 characters) *
+          </label>
+          <input type="password" id="reg-password" class="form-input" placeholder="Create strong password" required autocomplete="new-password">
+        </div>
+        <button type="submit" id="reg-btn" class="btn btn-primary btn-block">
+          <span class="material-icons-round">how_to_reg</span> Register Institutional Account
+        </button>
+        <div id="reg-error" class="login-error" role="alert" aria-live="polite"></div>
+        <div class="auth-toggle-box" style="text-align: center; margin-top: var(--space-4); border-top: 1px solid var(--border-color); padding-top: var(--space-3);">
+          <button type="button" id="show-login-btn" class="btn btn-ghost btn-sm btn-block">
+            <span class="material-icons-round">arrow_back</span> Already have an account? Sign In
+          </button>
+        </div>
       </form>
     </div>
   </div>

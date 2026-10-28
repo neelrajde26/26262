@@ -31,6 +31,7 @@ const API = {
 
     try {
       const res = await fetch(`${this.baseUrl}${endpoint}`, {
+        credentials: 'same-origin',
         ...options,
         headers
       });
@@ -43,6 +44,20 @@ const API = {
       }
 
       if (!res.ok) {
+        // If session expired or revoked, synchronize local session termination
+        if (res.status === 401 && !endpoint.startsWith('/api/auth/login') && !endpoint.startsWith('/api/auth/register')) {
+          this.setToken(null);
+          if (typeof Store !== 'undefined' && Store.clearSession) {
+            Store.clearSession();
+          }
+          if (typeof App !== 'undefined' && App.showLogin && (!endpoint.includes('/api/auth/me'))) {
+            App.showLogin();
+            if (typeof Components !== 'undefined' && Components.showToast) {
+              Components.showToast('Session expired or revoked. Please sign in again.', 'warning', 'Session Inactive');
+            }
+          }
+        }
+
         const errorMsg = data.detail || data.error || data.title || `HTTP error ${res.status}`;
         const err = new Error(errorMsg);
         err.status = res.status;
@@ -95,6 +110,15 @@ const API = {
     const data = await this.request('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify({ username, password })
+    });
+    if (data.token) this.setToken(data.token);
+    return data;
+  },
+
+  async register(registrationData) {
+    const data = await this.request('/api/auth/register', {
+      method: 'POST',
+      body: JSON.stringify(registrationData)
     });
     if (data.token) this.setToken(data.token);
     return data;
@@ -261,6 +285,19 @@ const API = {
 
   async getAdminUsers() {
     return this.request('/api/admin/users');
+  },
+
+  async createAdminUser(userData) {
+    return this.request('/api/admin/users', {
+      method: 'POST',
+      body: JSON.stringify(userData)
+    });
+  },
+
+  async toggleAdminUser(userId) {
+    return this.request(`/api/admin/users/${encodeURIComponent(userId)}/toggle`, {
+      method: 'POST'
+    });
   },
 
   async getAdminEscalationRules() {

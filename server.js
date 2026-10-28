@@ -12,6 +12,7 @@ const crypto = require('node:crypto');
 const { db, seedDatabase, hashPassword } = require('./server/db.js');
 const {
   ROLES,
+  createToken,
   authenticateUser,
   getSessionFromRequest,
   hasPermission,
@@ -364,7 +365,12 @@ const server = http.createServer(async (req, res) => {
       // 2. Authentication: Login
       if (pathname === '/api/auth/login' && method === 'POST') {
         const body = await parseBody(req);
-        if (!body.username || !body.password) {
+        if (
+          typeof body.username !== 'string' ||
+          typeof body.password !== 'string' ||
+          !body.username.trim() ||
+          !body.password
+        ) {
           return sendProblem(res, 400, 'Bad Request', 'Username and password are required', pathname);
         }
 
@@ -380,7 +386,7 @@ const server = http.createServer(async (req, res) => {
           );
         }
 
-        const result = authenticateUser(body.username.trim(), body.password);
+        const result = authenticateUser(body.username.trim(), body.password, getClientIp(req));
         if (!result.success) {
           registerFailedLoginAttempt(loginKey);
           return sendProblem(res, 401, 'Unauthorized', result.error, pathname);
@@ -395,6 +401,148 @@ const server = http.createServer(async (req, res) => {
           success: true,
           user: result.user,
           token: result.token
+        }, { 'Set-Cookie': cookie });
+      }
+
+      // 2b. Authentication: Institutional Registration
+      if (pathname === '/api/auth/register' && method === 'POST') {
+        const body = await parseBody(req);
+        const { username, password, fullName, email, institutionName, region } = body;
+
+        if (
+          typeof username !== 'string' ||
+          typeof password !== 'string' ||
+          typeof fullName !== 'string' ||
+          typeof email !== 'string' ||
+          typeof institutionName !== 'string' ||
+          typeof region !== 'string' ||
+          !username.trim() ||
+          !password ||
+          !fullName.trim() ||
+          !email.trim() ||
+          !institutionName.trim() ||
+          !region.trim()
+        ) {
+          return sendProblem(res, 400, 'Bad Request', 'All fields (username, password, fullName, email, institutionName, region) are required', pathname);
+        }
+
+        const trimmedUser = username.trim();
+        if (trimmedUser.length < 3 || trimmedUser.length > 30 || !/^[a-zA-Z0-9_]+$/.test(trimmedUser)) {
+          return sendProblem(res, 400, 'Bad Request', 'Username must be 3-30 alphanumeric characters or underscores', pathname);
+        }
+
+        if (password.length < 8) {
+          return sendProblem(res, 400, 'Bad Request', 'Password must be at least 8 characters long', pathname);
+        }
+
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+          return sendProblem(res, 400, 'Bad Request', 'Invalid email format', pathname);
+        }
+
+        const validRegions = ['reg-north', 'reg-south', 'reg-west', 'reg-east'];
+        if (!validRegions.includes(region.trim())) {
+          return sendProblem(res, 400, 'Bad Request', 'Invalid region. Must be reg-north, reg-south, reg-west, or reg-east', pathname);
+        }
+
+        const ip = getClientIp(req);
+        const regRateKey = `reg::${ip}`;
+        const limitState = getLoginRateLimitState(regRateKey);
+        if (limitState.limited) {
+          return sendProblem(res, 429, 'Too Many Requests', 'Too many registration attempts from this IP. Please try again later.', pathname);
+        }
+
+        const existingUser = db.prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?)').get(trimmedUser);
+        if (existingUser) {
+          registerFailedLoginAttempt(regRateKey);
+          return sendProblem(res, 409, 'Conflict', 'Username is already taken', pathname);
+        }
+
+        const existingEmail = db.prepare('SELECT id FROM users WHERE LOWER(email) = LOWER(?)').get(email.trim());
+        if (existingEmail) {
+          registerFailedLoginAttempt(regRateKey);
+          return sendProblem(res, 409, 'Conflict', 'Email address is already registered', pathname);
+        }
+
+        // STRICT LEAST PRIVILEGE: Hardcoded role 'institution'. Never trust client-supplied roles.
+        const assignedRole = 'institution';
+        const instId = 'inst-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+        const aicteId = '1-' + (10000000 + Math.floor(Math.random() * 90000000));
+        const nowStr = new Date().toISOString();
+
+        db.prepare(`
+          INSERT INTO institutions (id, name, aicte_id, type, state, city, region, established, status, contact_person, contact_email, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          instId,
+          institutionName.trim(),
+          aicteId,
+          'Engineering & Technology',
+          'Registered State',
+          'Registered City',
+          region.trim(),
+          new Date().getFullYear(),
+          'active',
+          fullName.trim(),
+          email.trim(),
+          nowStr
+        );
+
+        const { hash, salt } = hashPassword(password);
+        const newUserId = 'user-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+
+        db.prepare(`
+          INSERT INTO users (id, username, password_hash, salt, full_name, role, region, institution_id, email, active, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          newUserId,
+          trimmedUser,
+          hash,
+          salt,
+          fullName.trim(),
+          assignedRole,
+          region.trim(),
+          instId,
+          email.trim(),
+          1,
+          nowStr
+        );
+
+        db.prepare('INSERT INTO audit_trail VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
+          'aud-' + Date.now().toString(36),
+          newUserId,
+          fullName.trim(),
+          'user_registered',
+          'user',
+          newUserId,
+          `New institutional representative '${fullName.trim()}' registered for institution '${institutionName.trim()}'`,
+          null,
+          null,
+          ip,
+          nowStr
+        );
+
+        const sessionUser = {
+          userId: newUserId,
+          username: trimmedUser,
+          fullName: fullName.trim(),
+          role: assignedRole,
+          region: region.trim(),
+          institutionId: instId,
+          bureau: null,
+          committeeType: null,
+          email: email.trim()
+        };
+
+        const token = createToken(sessionUser);
+        const isHttps = req.headers['x-forwarded-proto'] === 'https';
+        const secureFlag = isHttps ? '; Secure' : '';
+        const cookie = `flowguard_token=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400${secureFlag}`;
+
+        return sendJSON(res, 201, {
+          success: true,
+          message: 'Institutional account registered successfully',
+          user: sessionUser,
+          token
         }, { 'Set-Cookie': cookie });
       }
 
@@ -1330,6 +1478,112 @@ const server = http.createServer(async (req, res) => {
         }
         const users = db.prepare('SELECT id, username, full_name, role, region, institution_id, email, active, created_at FROM users').all();
         return sendJSON(res, 200, { users });
+      }
+
+      if (pathname === '/api/admin/users' && method === 'POST') {
+        if (session.role !== 'admin') {
+          return sendProblem(res, 403, 'Forbidden', 'Admin role required to create users', pathname);
+        }
+        const body = await parseBody(req);
+        if (!body.username || !body.password || !body.fullName || !body.role) {
+          return sendProblem(res, 400, 'Bad Request', 'username, password, fullName, and role are required', pathname);
+        }
+        const role = body.role.trim();
+        if (!ROLES[role]) {
+          return sendProblem(res, 400, 'Bad Request', `Invalid role '${role}'`, pathname);
+        }
+        const username = body.username.trim();
+        if (username.length < 3) {
+          return sendProblem(res, 400, 'Bad Request', 'Username must be at least 3 characters', pathname);
+        }
+        const existing = db.prepare('SELECT id FROM users WHERE LOWER(username) = LOWER(?)').get(username);
+        if (existing) {
+          return sendProblem(res, 409, 'Conflict', 'Username is already taken', pathname);
+        }
+
+        const { hash, salt } = hashPassword(body.password);
+        const newUserId = 'user-' + Date.now().toString(36) + '-' + Math.random().toString(36).substring(2, 6);
+        const nowStr = new Date().toISOString();
+        db.prepare(`
+          INSERT INTO users (id, username, password_hash, salt, full_name, role, region, institution_id, bureau, committee_type, email, active, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          newUserId,
+          username,
+          hash,
+          salt,
+          body.fullName.trim(),
+          role,
+          body.region || null,
+          body.institutionId || null,
+          body.bureau || null,
+          body.committeeType || null,
+          body.email || `${username}@demo.flowguard.in`,
+          1,
+          nowStr
+        );
+
+        db.prepare('INSERT INTO audit_trail VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
+          'aud-' + Date.now().toString(36),
+          session.userId,
+          session.fullName,
+          'admin_create_user',
+          'user',
+          newUserId,
+          `Administrator created user '${username}' with role '${ROLES[role]?.label || role}'`,
+          null,
+          null,
+          getClientIp(req),
+          nowStr
+        );
+
+        return sendJSON(res, 201, {
+          success: true,
+          user: {
+            id: newUserId,
+            username,
+            fullName: body.fullName.trim(),
+            role,
+            region: body.region || null,
+            institutionId: body.institutionId || null,
+            email: body.email || `${username}@demo.flowguard.in`,
+            active: 1,
+            createdAt: nowStr
+          }
+        });
+      }
+
+      const toggleUserMatch = pathname.match(/^\/api\/admin\/users\/([^/]+)\/toggle$/);
+      if (toggleUserMatch && (method === 'POST' || method === 'PUT')) {
+        if (session.role !== 'admin') {
+          return sendProblem(res, 403, 'Forbidden', 'Admin role required to manage users', pathname);
+        }
+        const targetUserId = toggleUserMatch[1];
+        if (targetUserId === session.userId) {
+          return sendProblem(res, 400, 'Bad Request', 'Cannot disable your own administrator account', pathname);
+        }
+        const targetUser = db.prepare('SELECT * FROM users WHERE id = ?').get(targetUserId);
+        if (!targetUser) {
+          return sendProblem(res, 404, 'Not Found', 'User not found', pathname);
+        }
+        const newStatus = targetUser.active === 1 ? 0 : 1;
+        db.prepare('UPDATE users SET active = ? WHERE id = ?').run(newStatus, targetUserId);
+
+        db.prepare('INSERT INTO audit_trail VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
+          'aud-' + Date.now().toString(36),
+          session.userId,
+          session.fullName,
+          newStatus === 1 ? 'admin_enable_user' : 'admin_disable_user',
+          'user',
+          targetUserId,
+          `Administrator ${newStatus === 1 ? 'enabled' : 'disabled'} user '${targetUser.username}'`,
+          null,
+          null,
+          getClientIp(req),
+          new Date().toISOString()
+        );
+
+        return sendJSON(res, 200, { success: true, userId: targetUserId, active: newStatus });
       }
 
       // 34. Admin: Reset Demo Data

@@ -88,6 +88,83 @@ const App = {
       });
     }
 
+    // Toggle between login and registration forms
+    const showRegisterBtn = document.getElementById('show-register-btn');
+    const showLoginBtn = document.getElementById('show-login-btn');
+    const loginFormEl = document.getElementById('login-form');
+    const registerFormEl = document.getElementById('register-form');
+    const regErrorDiv = document.getElementById('reg-error');
+    const loginErrorDiv = document.getElementById('login-error');
+
+    if (showRegisterBtn && registerFormEl && loginFormEl) {
+      showRegisterBtn.addEventListener('click', () => {
+        loginFormEl.hidden = true;
+        loginFormEl.style.display = 'none';
+        registerFormEl.hidden = false;
+        registerFormEl.style.display = 'block';
+        if (loginErrorDiv) loginErrorDiv.textContent = '';
+        if (regErrorDiv) regErrorDiv.textContent = '';
+      });
+    }
+
+    if (showLoginBtn && registerFormEl && loginFormEl) {
+      showLoginBtn.addEventListener('click', () => {
+        registerFormEl.hidden = true;
+        registerFormEl.style.display = 'none';
+        loginFormEl.hidden = false;
+        loginFormEl.style.display = 'block';
+        if (loginErrorDiv) loginErrorDiv.textContent = '';
+        if (regErrorDiv) regErrorDiv.textContent = '';
+      });
+    }
+
+    // Registration form submit handler
+    if (registerFormEl) {
+      registerFormEl.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const regSubmitBtn = document.getElementById('reg-btn');
+        const instNameInput = document.getElementById('reg-inst-name');
+        const regionSelect = document.getElementById('reg-region');
+        const fullNameInput = document.getElementById('reg-fullname');
+        const emailInput = document.getElementById('reg-email');
+        const usernameInput = document.getElementById('reg-username');
+        const passwordInput = document.getElementById('reg-password');
+
+        if (regSubmitBtn) {
+          regSubmitBtn.disabled = true;
+          regSubmitBtn.innerHTML = '<span class="spinner" style="width:16px;height:16px;display:inline-block;border:2px solid #fff;border-top-color:transparent;border-radius:50%;animation:spin 0.8s linear infinite;vertical-align:middle;margin-right:6px;"></span> Registering...';
+        }
+
+        try {
+          const result = await Auth.register({
+            institutionName: instNameInput.value.trim(),
+            region: regionSelect.value,
+            fullName: fullNameInput.value.trim(),
+            email: emailInput.value.trim(),
+            username: usernameInput.value.trim(),
+            password: passwordInput.value
+          });
+
+          if (result.success) {
+            if (regErrorDiv) regErrorDiv.textContent = '';
+            await Store.loadAll();
+            this.showApp();
+            Router.navigate('dashboard');
+            Components.showToast(`Registration complete! Welcome, ${result.session.fullName}!`, 'success', 'Account Registered');
+          } else {
+            if (regErrorDiv) regErrorDiv.textContent = result.error || 'Registration failed';
+          }
+        } catch (err) {
+          if (regErrorDiv) regErrorDiv.textContent = err.message || 'Unable to complete registration';
+        } finally {
+          if (regSubmitBtn) {
+            regSubmitBtn.disabled = false;
+            regSubmitBtn.innerHTML = '<span class="material-icons-round">how_to_reg</span> Register Institutional Account';
+          }
+        }
+      });
+    }
+
     // Toggle demo accounts list
     const demoToggle = document.getElementById('show-demo-accounts');
     const demoList = document.getElementById('demo-accounts-list');
@@ -272,6 +349,28 @@ const App = {
       shell.hidden = true;
       shell.style.display = 'none';
     }
+
+    const loginFormEl = document.getElementById('login-form');
+    const registerFormEl = document.getElementById('register-form');
+    if (loginFormEl) {
+      loginFormEl.hidden = false;
+      loginFormEl.style.display = 'block';
+    }
+    if (registerFormEl) {
+      registerFormEl.hidden = true;
+      registerFormEl.style.display = 'none';
+    }
+
+    const passwordInput = document.getElementById('login-password');
+    if (passwordInput) passwordInput.value = '';
+    const regPasswordInput = document.getElementById('reg-password');
+    if (regPasswordInput) regPasswordInput.value = '';
+
+    const errorDiv = document.getElementById('login-error');
+    if (errorDiv) errorDiv.textContent = '';
+    const regErrorDiv = document.getElementById('reg-error');
+    if (regErrorDiv) regErrorDiv.textContent = '';
+
     const modal = document.getElementById('modal-overlay');
     if (modal) {
       modal.hidden = true;
