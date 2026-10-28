@@ -161,9 +161,19 @@ const Store = {
       const activeSession = Auth.getSession();
       if (activeSession?.role === 'admin') {
         try {
-          const wfRes = await API.getAdminWorkflows();
-          if (wfRes?.templates) {
-            this._cache.workflowTemplates = wfRes.templates;
+          const [wfRes, usersRes, escRes] = await Promise.allSettled([
+            API.getAdminWorkflows(),
+            API.getAdminUsers(),
+            API.getAdminEscalationRules()
+          ]);
+          if (wfRes.status === 'fulfilled' && wfRes.value?.templates) {
+            this._cache.workflowTemplates = wfRes.value.templates;
+          }
+          if (usersRes.status === 'fulfilled' && usersRes.value?.users) {
+            this._cache.users = usersRes.value.users;
+          }
+          if (escRes.status === 'fulfilled' && escRes.value?.escalationRules) {
+            this._cache.escalationRules = escRes.value.escalationRules;
           }
         } catch (e) {}
       }

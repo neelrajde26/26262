@@ -137,8 +137,22 @@ function verifyToken(token) {
       return null;
     }
 
+    const headerObj = JSON.parse(Buffer.from(header, 'base64url').toString('utf8'));
+    if (!headerObj || headerObj.alg !== 'HS256' || headerObj.typ !== 'JWT') {
+      return null;
+    }
+
     const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
-    if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) return null;
+    if (!payload || typeof payload !== 'object') return null;
+
+    const now = Math.floor(Date.now() / 1000);
+    if (!payload.exp || typeof payload.exp !== 'number' || payload.exp < now) {
+      return null;
+    }
+    if (payload.iat && typeof payload.iat === 'number' && payload.iat > now + 60) {
+      return null;
+    }
+
     return payload;
   } catch (err) {
     return null;
@@ -146,16 +160,29 @@ function verifyToken(token) {
 }
 
 // Authenticate user via username and password
-function authenticateUser(username, password) {
-  if (!username || !password) {
+function authenticateUser(username, password, ipAddress = '127.0.0.1') {
+  if (typeof username !== 'string' || typeof password !== 'string') {
     return { success: false, error: 'Username and password are required' };
   }
 
-  const user = db.prepare('SELECT * FROM users WHERE username = ? AND active = 1').get(username);
-  if (!user) return { success: false, error: 'Invalid credentials or account disabled' };
+  const trimmedUsername = username.trim();
+  if (!trimmedUsername || !password) {
+    return { success: false, error: 'Username and password are required' };
+  }
+
+  const user = db.prepare('SELECT * FROM users WHERE LOWER(username) = LOWER(?)').get(trimmedUsername);
+  if (!user) {
+    return { success: false, error: 'Invalid username or password' };
+  }
+
+  if (user.active !== 1) {
+    return { success: false, error: 'Account is disabled. Please contact administrator.' };
+  }
 
   const valid = verifyPassword(password, user.password_hash, user.salt);
-  if (!valid) return { success: false, error: 'Invalid credentials' };
+  if (!valid) {
+    return { success: false, error: 'Invalid username or password' };
+  }
 
   const sessionUser = {
     userId: user.id,
@@ -184,14 +211,14 @@ function authenticateUser(username, password) {
     `${user.full_name} signed in as ${ROLES[user.role]?.label || user.role}`,
     null,
     null,
-    '127.0.0.1',
+    ipAddress || '127.0.0.1',
     new Date().toISOString()
   );
 
   return { success: true, user: sessionUser, token };
 }
 
-// Middleware: extract token from Authorization header or Cookie
+// Middleware: extract token from Authorization header or Cookie and verify active status in database
 function getSessionFromRequest(req) {
   let token = null;
   const authHeader = req.headers['authorization'];
@@ -201,7 +228,29 @@ function getSessionFromRequest(req) {
     const match = req.headers['cookie'].match(/flowguard_token=([^;]+)/);
     if (match) token = match[1];
   }
-  return verifyToken(token);
+
+  const payload = verifyToken(token);
+  if (!payload || !payload.userId) return null;
+
+  try {
+    const user = db.prepare('SELECT id, username, full_name, role, region, institution_id, bureau, committee_type, email, active FROM users WHERE id = ?').get(payload.userId);
+    if (!user || user.active !== 1) {
+      return null;
+    }
+    return {
+      userId: user.id,
+      username: user.username,
+      fullName: user.full_name,
+      role: user.role,
+      region: user.region,
+      institutionId: user.institution_id,
+      bureau: user.bureau,
+      committeeType: user.committee_type,
+      email: user.email
+    };
+  } catch (err) {
+    return null;
+  }
 }
 
 // Check permission

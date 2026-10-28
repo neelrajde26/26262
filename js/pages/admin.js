@@ -497,7 +497,7 @@ const AdminPage = {
     Components.showModal('Create User Account', bodyHtml, footerHtml);
   },
 
-  handleAddUserSubmit() {
+  async handleAddUserSubmit() {
     const nameInput = document.getElementById('modal-user-name');
     const usernameInput = document.getElementById('modal-user-username');
     const roleSelect = document.getElementById('modal-user-role');
@@ -514,15 +514,30 @@ const AdminPage = {
       fullName: nameInput.value.trim(),
       role: roleSelect.value,
       region: regionSelect.value || null,
-      passwordHash: Utils.simpleHash(pwdInput.value),
-      email: `${usernameInput.value.trim()}@demo.flowguard.in`,
-      active: true
+      password: pwdInput.value,
+      email: `${usernameInput.value.trim()}@demo.flowguard.in`
     };
 
-    Store.create('users', newUser);
-    Components.closeModal();
-    Components.showToast(`User account "${newUser.username}" created!`, 'success');
-    this.render();
+    try {
+      await API.createAdminUser(newUser);
+      Components.closeModal();
+      Components.showToast(`User account "${newUser.username}" created successfully!`, 'success');
+      await Store.loadAll();
+      await this.render();
+    } catch (err) {
+      Components.showToast(err.message || 'Failed to create user', 'error');
+    }
+  },
+
+  async toggleUserActive(userId) {
+    try {
+      const res = await API.toggleAdminUser(userId);
+      Components.showToast(`User status updated to ${res.active === 1 ? 'Active' : 'Disabled'}`, 'info');
+      await Store.loadAll();
+      await this.render();
+    } catch (err) {
+      Components.showToast(err.message || 'Failed to update user status', 'error');
+    }
   },
 
   async resetDemoData() {
