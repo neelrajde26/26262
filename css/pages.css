@@ -1,0 +1,321 @@
+/* ============================================
+   AICTE FlowGuard — Page-Specific Styles
+   ============================================ */
+
+/* ---- Dashboard ---- */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: var(--space-4);
+  margin-bottom: var(--space-6);
+}
+
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: var(--space-5);
+}
+
+.dashboard-grid-full {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-5);
+  margin-top: var(--space-5);
+}
+
+/* ---- Application List ---- */
+.app-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-4);
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.app-id-cell {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  color: var(--color-primary-600);
+}
+
+.institution-cell {
+  max-width: 240px;
+}
+
+.institution-name {
+  font-weight: var(--font-weight-medium);
+  font-size: var(--font-size-sm);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.institution-location {
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+}
+
+.age-cell {
+  font-size: var(--font-size-sm);
+}
+
+.overdue { color: var(--color-danger-500); font-weight: var(--font-weight-semibold); }
+.approaching { color: var(--color-warning-700); }
+
+/* ---- Application Detail ---- */
+.detail-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-5);
+  flex-wrap: wrap;
+}
+
+.detail-title-group {
+  flex: 1;
+}
+
+.detail-app-id {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--color-primary-600);
+  font-weight: var(--font-weight-medium);
+  margin-bottom: var(--space-1);
+}
+
+.detail-institution-name {
+  font-size: var(--font-size-xl);
+  font-weight: var(--font-weight-bold);
+  margin-bottom: var(--space-1);
+}
+
+.detail-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.stage-progress {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  margin: var(--space-5) 0;
+  overflow-x: auto;
+  padding: var(--space-2) 0;
+}
+
+.stage-node {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-1);
+  flex-shrink: 0;
+  min-width: 100px;
+}
+
+.stage-circle {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px solid var(--border-color);
+  background: var(--bg-surface);
+  transition: all var(--transition-base);
+}
+
+.stage-circle .material-icons-round { font-size: 18px; color: var(--text-tertiary); }
+
+.stage-node.completed .stage-circle {
+  background: var(--color-success-500);
+  border-color: var(--color-success-500);
+}
+.stage-node.completed .stage-circle .material-icons-round { color: #fff; }
+
+.stage-node.active .stage-circle {
+  background: var(--color-primary-500);
+  border-color: var(--color-primary-500);
+  box-shadow: 0 0 0 4px rgba(63,81,181,0.15);
+}
+.stage-node.active .stage-circle .material-icons-round { color: #fff; }
+
+.stage-node.returned .stage-circle {
+  background: var(--color-warning-500);
+  border-color: var(--color-warning-500);
+}
+.stage-node.returned .stage-circle .material-icons-round { color: #fff; }
+
+.stage-node.skipped .stage-circle { opacity: 0.4; }
+
+.stage-label {
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  text-align: center;
+  font-weight: var(--font-weight-medium);
+  max-width: 90px;
+}
+
+.stage-connector {
+  width: 40px;
+  height: 2px;
+  background: var(--border-color);
+  flex-shrink: 0;
+  margin-bottom: 20px;
+}
+
+.stage-connector.completed { background: var(--color-success-500); }
+
+/* ---- EVC Page ---- */
+.evc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: var(--space-4);
+}
+
+.evc-card {
+  border-left: 4px solid var(--color-primary-500);
+}
+
+.evc-card.overdue-card { border-left-color: var(--color-danger-500); }
+.evc-card.scheduled-card { border-left-color: var(--color-info-500); }
+.evc-card.completed-card { border-left-color: var(--color-success-500); }
+
+/* ---- Undertakings ---- */
+.undertaking-card {
+  border-left: 4px solid var(--color-accent-500);
+}
+
+.evidence-list {
+  margin-top: var(--space-3);
+}
+
+.evidence-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-tertiary);
+  border-radius: var(--border-radius-sm);
+  margin-bottom: var(--space-2);
+}
+
+.evidence-file {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-size-sm);
+}
+
+.evidence-file .material-icons-round { font-size: 18px; color: var(--text-tertiary); }
+
+/* ---- Documents ---- */
+.doc-status-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.doc-expiry {
+  font-size: var(--font-size-xs);
+  padding: 2px 8px;
+  border-radius: var(--border-radius-full);
+}
+
+.doc-expiry.expired { background: var(--color-danger-50); color: var(--color-danger-700); }
+.doc-expiry.expiring-soon { background: var(--color-warning-50); color: var(--color-warning-700); }
+.doc-expiry.valid { background: var(--color-success-50); color: var(--color-success-700); }
+
+/* ---- Reports ---- */
+.report-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-5);
+  flex-wrap: wrap;
+}
+
+.report-section {
+  margin-bottom: var(--space-6);
+}
+
+/* ---- Audit Trail ---- */
+.audit-entry {
+  display: flex;
+  gap: var(--space-3);
+  padding: var(--space-3) 0;
+  border-bottom: 1px solid var(--border-color);
+  font-size: var(--font-size-sm);
+}
+
+.audit-entry:last-child { border-bottom: none; }
+
+.audit-actor {
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-primary-600);
+  white-space: nowrap;
+}
+
+.audit-action {
+  flex: 1;
+}
+
+.audit-time {
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+/* ---- Admin ---- */
+.admin-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: var(--space-5);
+}
+
+.admin-section {
+  margin-bottom: var(--space-6);
+}
+
+.workflow-stage-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.workflow-stage-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--bg-tertiary);
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-color);
+}
+
+.workflow-stage-item .stage-order {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--color-primary-500);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-bold);
+  flex-shrink: 0;
+}
+
+.workflow-stage-item .stage-name {
+  flex: 1;
+  font-weight: var(--font-weight-medium);
+}
+
+.workflow-stage-item .stage-timeline {
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+}

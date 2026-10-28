@@ -1,0 +1,234 @@
+/* ============================================
+   AICTE FlowGuard — Automated Test Suite
+   ============================================ */
+
+const assert = require('node:assert');
+const { db, seedDatabase, hashPassword, verifyPassword } = require('../server/db.js');
+const {
+  ROLES,
+  createToken,
+  verifyToken,
+  authenticateUser,
+  hasPermission,
+  getScopeClause
+} = require('../server/auth.js');
+const WorkflowEngine = require('../server/workflow-engine.js');
+const Scheduler = require('../server/scheduler.js');
+const AIService = require('../server/ai-service.js');
+
+let passedTests = 0;
+let failedTests = 0;
+
+function test(name, fn) {
+  try {
+    fn();
+    console.log(`  ✓ ${name}`);
+    passedTests++;
+  } catch (err) {
+    console.error(`  ✗ ${name}`);
+    console.error(`    Error: ${err.message}`);
+    failedTests++;
+  }
+}
+
+async function asyncTest(name, fn) {
+  try {
+    await fn();
+    console.log(`  ✓ ${name}`);
+    passedTests++;
+  } catch (err) {
+    console.error(`  ✗ ${name}`);
+    console.error(`    Error: ${err.message}`);
+    failedTests++;
+  }
+}
+
+async function runAllTests() {
+  console.log('\n================================================');
+  console.log(' 🛡️  AICTE FlowGuard Automated Test Runner');
+  console.log('================================================\n');
+
+  // Ensure clean test database state
+  seedDatabase(true);
+
+  console.log('--- 1. Database & Schema Verification ---');
+  test('All core tables and indexes are created in SQLite', () => {
+    const tables = db.prepare(`
+      SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'
+    `).all().map(t => t.name);
+
+    const required = [
+      'users', 'institutions', 'regions', 'workflow_templates',
+      'applications', 'stage_history', 'evc_events', 'undertakings',
+      'undertaking_submissions', 'documents', 'escalation_rules',
+      'notifications', 'audit_trail'
+    ];
+
+    for (const r of required) {
+      assert.ok(tables.includes(r), `Missing table: ${r}`);
+    }
+  });
+
+  test('Database seeded with realistic demo fixtures', () => {
+    const userCount = db.prepare('SELECT count(*) as c FROM users').get().c;
+    const appCount = db.prepare('SELECT count(*) as c FROM applications').get().c;
+    const undCount = db.prepare('SELECT count(*) as c FROM undertakings').get().c;
+    const docCount = db.prepare('SELECT count(*) as c FROM documents').get().c;
+
+    assert.ok(userCount >= 7, 'Users seeded');
+    assert.ok(appCount >= 5, 'Applications seeded');
+    assert.ok(undCount >= 3, 'Undertakings seeded');
+    assert.ok(docCount >= 4, 'Documents seeded');
+  });
+
+  console.log('\n--- 2. Authentication & Cryptography ---');
+  test('Password hashing generates valid salt and PBKDF2 hash', () => {
+    const { hash, salt } = hashPassword('TestPassword123');
+    assert.ok(hash && hash.length === 64, 'Hash is valid 64-character hex');
+    assert.ok(salt && salt.length === 32, 'Salt is valid 32-character hex');
+    assert.ok(verifyPassword('TestPassword123', hash, salt), 'Valid password verified');
+    assert.ok(!verifyPassword('WrongPassword', hash, salt), 'Invalid password rejected');
+  });
+
+  test('User authentication returns signed JWT token', () => {
+    const res = authenticateUser('ro_north', 'demo123');
+    assert.strictEqual(res.success, true);
+    assert.strictEqual(res.user.role, 'regional_officer');
+    assert.ok(res.token, 'Token returned');
+
+    const decoded = verifyToken(res.token);
+    assert.strictEqual(decoded.username, 'ro_north');
+    assert.strictEqual(decoded.role, 'regional_officer');
+  });
+
+  test('Tampered token is rejected', () => {
+    const res = authenticateUser('ro_north', 'demo123');
+    const parts = res.token.split('.');
+    const tampered = `${parts[0]}.${parts[1]}.invalidSignature999`;
+    assert.strictEqual(verifyToken(tampered), null);
+  });
+
+  console.log('\n--- 3. Role-Based Access Control & Scoping ---');
+  test('Role permissions enforced correctly', () => {
+    // Institution user cannot advance stage or approve
+    assert.ok(!hasPermission('institution', 'advance_stage'));
+    assert.ok(!hasPermission('institution', 'approve_application'));
+    assert.ok(hasPermission('institution', 'submit_application'));
+
+    // Regional officer can advance but not approve
+    assert.ok(hasPermission('regional_officer', 'advance_stage'));
+    assert.ok(!hasPermission('regional_officer', 'approve_application'));
+
+    // Competent Authority can approve
+    assert.ok(hasPermission('competent_authority', 'approve_application'));
+  });
+
+  test('SQL data scoping filters records by institution and region', () => {
+    const instUser = { role: 'institution', institutionId: 'inst-001' };
+    const instScope = getScopeClause(instUser);
+    assert.ok(instScope.sql.includes('institution_id = ?'));
+    assert.deepStrictEqual(instScope.params, ['inst-001']);
+
+    const roUser = { role: 'regional_officer', region: 'reg-north' };
+    const roScope = getScopeClause(roUser);
+    assert.ok(roScope.sql.includes('region = ?'));
+    assert.deepStrictEqual(roScope.params, ['reg-north']);
+
+    const caUser = { role: 'competent_authority' };
+    const caScope = getScopeClause(caUser);
+    assert.strictEqual(caScope.sql, '1 = 1');
+  });
+
+  console.log('\n--- 4. Workflow Transition Engine ---');
+  test('Authorized officer can advance application stage', () => {
+    const ro = { userId: 'user-ro1', fullName: 'Dr. Priya Mehta', role: 'regional_officer' };
+    const res = WorkflowEngine.advanceStage('app-001', 'evc-pending', 'Scrutiny verified all criteria', ro);
+    assert.strictEqual(res.success, true);
+    assert.strictEqual(res.currentStage, 'evc-pending');
+
+    const updated = db.prepare('SELECT current_stage, status FROM applications WHERE id = ?').get('app-001');
+    assert.strictEqual(updated.current_stage, 'evc-pending');
+
+    const history = db.prepare('SELECT * FROM stage_history WHERE application_id = ? AND stage = ?').get('app-001', 'evc-pending');
+    assert.ok(history, 'Stage history recorded');
+
+    const audit = db.prepare('SELECT * FROM audit_trail WHERE entity_id = ? AND action = ?').get('app-001', 'stage_advanced');
+    assert.ok(audit, 'Audit trail entry logged');
+  });
+
+  test('Unauthorized user is blocked from advancing workflow', () => {
+    const inst = { userId: 'user-inst1', fullName: 'Rajesh Sharma', role: 'institution' };
+    const res = WorkflowEngine.advanceStage('app-001', 'approved', 'Attempting self-approval', inst);
+    assert.strictEqual(res.success, false);
+    assert.ok(res.error.includes('Unauthorized'));
+  });
+
+  test('Returning application records mandatory reason and changes status', () => {
+    const ro = { userId: 'user-ro1', fullName: 'Dr. Priya Mehta', role: 'regional_officer' };
+    const res = WorkflowEngine.returnApplication('app-001', 'Incomplete laboratory floor plan proof', ro);
+    assert.strictEqual(res.success, true);
+
+    const updated = db.prepare('SELECT status, return_reason FROM applications WHERE id = ?').get('app-001');
+    assert.strictEqual(updated.status, 'returned');
+    assert.strictEqual(updated.return_reason, 'Incomplete laboratory floor plan proof');
+  });
+
+  test('Competent Authority can approve application', () => {
+    const ca = { userId: 'user-ca1', fullName: 'Dr. Meera Joshi', role: 'competent_authority' };
+    const res = WorkflowEngine.approveApplication('app-005', 'Approved after SAC recommendation', ca);
+    assert.strictEqual(res.success, true);
+
+    const updated = db.prepare('SELECT status, current_stage FROM applications WHERE id = ?').get('app-005');
+    assert.strictEqual(updated.status, 'approved');
+    assert.strictEqual(updated.current_stage, 'approved');
+  });
+
+  console.log('\n--- 5. Automated SLA Scheduler & Deduplication ---');
+  test('Scheduler runs pass 1: detects overdue and triggers alerts', () => {
+    const summary1 = Scheduler.runSchedulerOnce();
+    assert.ok(summary1.checkedApplications > 0, 'Checked active applications');
+    assert.ok(summary1.checkedUndertakings > 0, 'Checked undertakings');
+    assert.ok(summary1.checkedDocuments > 0, 'Checked statutory documents');
+    assert.ok(summary1.alertsGenerated > 0 || summary1.escalationsTriggered > 0, 'Alerts/Escalations evaluated');
+  });
+
+  test('Scheduler runs pass 2: deduplication prevents repeated alert spamming', () => {
+    const summary2 = Scheduler.runSchedulerOnce();
+    assert.strictEqual(summary2.alertsGenerated, 0, 'Zero new duplicate alerts generated');
+    assert.strictEqual(summary2.escalationsTriggered, 0, 'Zero new duplicate escalations generated');
+    assert.ok(summary2.duplicatesPrevented > 0, 'Deduplication actively prevented spam');
+  });
+
+  console.log('\n--- 6. AI-Assisted Services & Safe Fallbacks ---');
+  await asyncTest('AI Service generates application summary with human-in-the-loop disclaimers', async () => {
+    const summary = await AIService.summarizeApplication('app-007');
+    assert.strictEqual(summary.isAIGenerated, true);
+    assert.ok(summary.disclaimer.includes('AI-assisted guidance only'));
+    assert.ok(summary.overview.length > 20);
+    assert.ok(Array.isArray(summary.keyObservations));
+    assert.ok(Array.isArray(summary.suggestedNextActions));
+  });
+
+  test('AI Service generates APH compliance checklist for program types', () => {
+    const checklist = AIService.generateChecklist('new-institution');
+    assert.strictEqual(checklist.isAIGenerated, true);
+    assert.ok(checklist.items.length >= 4);
+    assert.ok(checklist.items.some(i => i.item.includes('Fire Safety')));
+  });
+
+  test('AI Regulatory query helper resolves workflow terminology', () => {
+    const result = AIService.regulatorySearch('What is EVC inspection?');
+    assert.strictEqual(result.isAIGenerated, true);
+    assert.ok(result.results.some(r => r.topic.includes('EVC')));
+  });
+
+  console.log('\n================================================');
+  console.log(` Test Results: ${passedTests} Passed, ${failedTests} Failed`);
+  console.log('================================================\n');
+
+  if (failedTests > 0) {
+    process.exit(1);
+  }
+}
+
+runAllTests();

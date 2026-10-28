@@ -1,0 +1,27 @@
+# Dependency directories
+node_modules/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# SQLite temporary WAL and SHM files
+data/*.db-wal
+data/*.db-shm
+
+# Uploaded dynamic files (keep directory via .gitkeep)
+uploads/*
+!uploads/.gitkeep
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment variables
+.env
+.env.local
+.env.*.local

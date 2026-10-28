@@ -1,0 +1,125 @@
+/* ============================================
+   AICTE FlowGuard — Responsive Styles
+   ============================================ */
+
+@media (max-width: 1024px) {
+  .dashboard-grid {
+    grid-template-columns: 1fr;
+  }
+  .dashboard-grid-full {
+    grid-template-columns: 1fr;
+  }
+  .stats-grid {
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  }
+}
+
+@media (max-width: 768px) {
+  .sidebar {
+    transform: translateX(-100%);
+    width: var(--sidebar-width);
+  }
+  .sidebar.mobile-open {
+    transform: translateX(0);
+  }
+  .main-content {
+    margin-left: 0 !important;
+  }
+  .mobile-only { display: flex; }
+  .page-container {
+    padding: var(--space-4);
+  }
+  .topbar {
+    padding: 0 var(--space-4);
+  }
+  .search-input {
+    width: 160px;
+  }
+  .search-input:focus {
+    width: 200px;
+  }
+  .notification-panel {
+    width: 100%;
+  }
+  .modal-content {
+    max-width: 100%;
+    margin: var(--space-4);
+  }
+  .stats-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+  .filters-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .filters-bar .form-input,
+  .filters-bar .form-select {
+    max-width: 100%;
+  }
+  .detail-header {
+    flex-direction: column;
+  }
+  .detail-actions {
+    width: 100%;
+  }
+  .stage-progress {
+    overflow-x: auto;
+  }
+  .evc-grid {
+    grid-template-columns: 1fr;
+  }
+  .detail-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (max-width: 480px) {
+  .stats-grid {
+    grid-template-columns: 1fr;
+  }
+  .detail-grid {
+    grid-template-columns: 1fr;
+  }
+  .form-row {
+    grid-template-columns: 1fr;
+  }
+  .login-container {
+    padding: var(--space-6);
+  }
+  .login-title {
+    font-size: var(--font-size-xl);
+  }
+  .pagination {
+    flex-direction: column;
+    text-align: center;
+  }
+}
+
+/* Sidebar mobile overlay */
+@media (max-width: 768px) {
+  .sidebar.mobile-open::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: -1;
+  }
+}
+
+/* Print styles */
+@media print {
+  .sidebar, .topbar, .toast-container, .notification-panel, .modal-overlay {
+    display: none !important;
+  }
+  .main-content {
+    margin-left: 0 !important;
+  }
+  .page-container {
+    max-width: 100%;
+    padding: 0;
+  }
+  .card {
+    box-shadow: none;
+    border: 1px solid #ddd;
+  }
+}
